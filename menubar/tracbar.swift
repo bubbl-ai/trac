@@ -5,6 +5,16 @@
 import AppKit
 import Foundation
 
+// trac.js lives one level above this binary (menubar/tracbar → trac.js), so the
+// checkout can sit anywhere. Common user-local Node installs are added to PATH
+// in case the login shell does not export them.
+let tracJS: String = {
+  let bin = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
+  let js = bin.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("trac.js").path
+  return "'" + js.replacingOccurrences(of: "'", with: "'\\''") + "'"
+}()
+let nodePath = "export PATH=\"$HOME/.local/node/bin:$HOME/.volta/bin:/opt/homebrew/bin:/usr/local/bin:$PATH\";"
+
 final class TracBar: NSObject, NSApplicationDelegate {
   var item: NSStatusItem!
   var timer: Timer?
@@ -31,7 +41,7 @@ final class TracBar: NSObject, NSApplicationDelegate {
       let proc = Process()
       proc.executableURL = URL(fileURLWithPath: "/bin/zsh")
       // login shell so node is on PATH regardless of how it was installed
-      proc.arguments = ["-lc", "node ~/trac/trac.js json"]
+      proc.arguments = ["-lc", "\(nodePath) node \(tracJS) json"]
       let pipe = Pipe()
       proc.standardOutput = pipe
       proc.standardError = Pipe()
@@ -118,7 +128,7 @@ final class TracBar: NSObject, NSApplicationDelegate {
       proc.executableURL = URL(fileURLWithPath: "/bin/zsh")
       // start the dashboard server if it isn't already running, then open it
       proc.arguments = ["-lc",
-        "pgrep -f 'trac.js ui' >/dev/null || (nohup node ~/trac/trac.js ui --no-open >/dev/null 2>&1 &); sleep 0.5; open http://localhost:7433"]
+        "\(nodePath) pgrep -f 'trac.js ui' >/dev/null || (nohup node \(tracJS) ui --no-open >/dev/null 2>&1 &); sleep 0.5; open http://localhost:7433"]
       try? proc.run()
     }
   }
