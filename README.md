@@ -73,6 +73,9 @@ trac run t3 --dry          # exercise the worktree flow without calling Claude
 trac run t3 --fresh        # start a paused or failed task over, discarding its session and branch
 trac morning               # what finished while you were away, marked as read
 trac ui                    # browser dashboard at http://localhost:7433
+trac sessions              # recent Claude Code sessions in this directory (--all for every project)
+trac adopt <session-id>    # hand an interactive session to trac, see below
+trac release t3            # take it back; prints the command to continue it yourself
 ```
 
 Flags for `trac add`:
@@ -128,6 +131,49 @@ but retrying it with `trac run` or the dashboard's Resume button continues the s
 session too. `trac run <id> --fresh` or the dashboard's Start over button discards the
 session and the branch and begins again from the spec.
 
+## Handing a session to Trac
+
+An interactive Claude Code session that hit the limit, or that you have to walk away
+from, can be handed to Trac. Trac continues it unattended under the same gates as any
+task, and hands it back whenever you want it.
+
+From inside the session, while Claude can still respond, type `/trac`. Install that
+command once with:
+
+```sh
+cp commands/trac.md ~/.claude/commands/
+```
+
+If the limit has already hit and Claude cannot respond, run the shell directly from the
+prompt box instead:
+
+```
+! trac adopt $CLAUDE_CODE_SESSION_ID
+```
+
+Or from any terminal: `trac sessions` lists recent sessions for the current directory
+with their titles, and `trac adopt <id>` takes one. Add `--note "..."` to tell the
+continuation what to focus on.
+
+What happens next:
+
+- **Trac forks the conversation.** Your original session is never written to. Trac's
+  copy gets its own id. Leave the interactive session once you have handed it off,
+  because anything you type there continues the old copy, not Trac's.
+- **The daemon continues the fork** when the window has room and you have been idle
+  15 minutes, with `claude --resume`, telling it the person had to stop and it should
+  finish the task. This runs in your working tree, not a worktree, because that is
+  what the conversation is about. It is told not to push, and not to commit unless
+  the conversation already asked for that.
+- **It pauses instead of failing** when the run hits the limit again or its 30 minute
+  slice or turn budget ends, and continues in the next slice with room, up to three
+  pauses.
+- **The morning report** shows what it did and the command to pick the conversation
+  up yourself, `claude --resume <id>`, with all of Trac's work in context.
+
+`trac release <id>` takes a session back at any time. If it is running, the run is
+stopped first. The dashboard's Release button does the same.
+
 ## Menu bar gauge
 
 An always-visible session percentage, refreshed every 60 seconds.
@@ -161,10 +207,14 @@ per-task reports, prepared spec folders, and worktrees. Delete the directory to 
   up to 15 minutes, then falls back to transcript estimates.
 - The runner spends your subscription quota. Set budgets you are comfortable losing to an
   unattended run, and start with `--analyze` tasks until you trust the output.
+- An adopted session edits your working tree, unlike a spec task. Hand over sessions whose
+  work you would be happy to find half done in the morning, and commit or stash anything
+  unrelated first.
 - Transcripts are parsed on every command, which takes under a second for a few weeks of
   history.
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md). Tracking, warnings, the task runner and the prep pass are
-built. Plan right-sizing, the weekly digest, a compiled binary and a team tier are not.
+See [ROADMAP.md](ROADMAP.md). Tracking, warnings, the task runner, the prep pass, pausing
+and resuming, and the session handoff are built. Plan right-sizing, the weekly digest, a
+compiled binary and a team tier are not.

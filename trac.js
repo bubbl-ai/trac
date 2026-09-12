@@ -605,25 +605,167 @@ function cmdTaskList() {
   console.log();
   for (const t of db.tasks) {
     const icons = { queued: "○", running: "◐", done: "●", failed: "✗", interrupted: "◑", paused: "◔", skipped: "–" };
-    const extra = t.status === "done" ? ` → ${t.branch}${t.commits ? ` (${t.commits} commits)` : ""}` :
+    const extra = t.status === "done" && t.kind === "session" ? ` → continue it: claude --resume ${t.sessionId}` :
+                  t.status === "done" ? ` → ${t.branch}${t.commits ? ` (${t.commits} commits)` : ""}` :
                   t.status === "failed" ? ` — ${t.error || "failed"}` :
                   t.status === "paused" ? ` — paused, quota exhausted; resumes when the window resets (attempt ${t.attempts || 1})` : "";
-    console.log(`  ${icons[t.status] || "?"} ${C.bold(t.id.padEnd(4))} [${t.mode}, p${t.priority}] ${path.basename(t.repo)}: ${titleOf(t).slice(0, 70)}${extra ? C.dim(extra) : ""}`);
+    console.log(`  ${icons[t.status] || "?"} ${C.bold(t.id.padEnd(4))} [${t.kind === "session" ? "session" : t.mode}, p${t.priority}] ${path.basename(t.repo)}: ${titleOf(t).slice(0, 70)}${extra ? C.dim(extra) : ""}`);
   }
   console.log();
 }
 
-function cmdTaskRm(id) {
+// Stop a running task's claude process. The dispatcher sees the close, finds the
+// record gone (rm) or marks it, and exits; the transcript on disk stays resumable.
+function stopTask(t) {
+  if (t.status !== "running" || !t.pid) return false;
+  try { process.kill(t.pid, "SIGTERM"); return true; } catch { return false; }
+}
+
+function cmdTaskRm(id, { release = false } = {}) {
   const db = loadTasks();
   const t = db.tasks.find((x) => x.id === id);
   if (!t) { console.error(`no task ${id}`); process.exit(1); }
+  const stopped = stopTask(t);
   if (t.worktree && fs.existsSync(t.worktree)) {
     try { execSync(`git -C ${JSON.stringify(t.repo)} worktree remove --force ${JSON.stringify(t.worktree)}`, { stdio: "ignore" }); } catch {}
   }
   const specDir = path.join(SPECS_DIR, id); // prep-created spec folder, if any
   if (fs.existsSync(specDir)) { try { fs.rmSync(specDir, { recursive: true, force: true }); } catch {} }
   mutateTasks((fresh) => { fresh.tasks = fresh.tasks.filter((x) => x.id !== id); });
-  console.log(`  removed ${id}`);
+  if (t.kind === "session") {
+    console.log(`  released ${id}${stopped ? " (stopped its run)" : ""}`);
+    console.log(`  continue it yourself: claude --resume ${t.sessionId || t.sourceSession}`);
+    if (t.sessionId) console.log(C.dim(`  that is trac's copy, with its work; your original is ${t.sourceSession.slice(0, 8)}`));
+  } else console.log(`  ${release ? "released" : "removed"} ${id}${stopped ? " (stopped its run)" : ""}`);
+}
+
+// ── Adopted sessions ────────────────────────────────────────────────────────
+// Claude Code keeps one transcript per session at ~/.claude/projects/<cwd
+// slug>/<session-id>.jsonl. `trac adopt` takes one over: the daemon continues
+// it, unattended, as a forked copy of the conversation in the user's own
+// working tree, under the same gates as any task. `trac release` hands it back.
+function projectSlug(cwd) { return cwd.replace(/[^a-zA-Z0-9]/g, "-"); }
+
+function sessionFiles({ cwd = null } = {}) {
+  const dirs = [];
+  if (cwd) {
+    const d = path.join(CLAUDE_DIR, projectSlug(cwd));
+    if (fs.existsSync(d)) dirs.push(d);
+  }
+  if (!cwd) for (const dir of safeReaddir(CLAUDE_DIR)) {
+    if (dir.includes("-trac-work-")) continue;
+    const full = path.join(CLAUDE_DIR, dir);
+    try { if (fs.statSync(full).isDirectory()) dirs.push(full); } catch {}
+  }
+  const files = [];
+  for (const d of dirs) for (const f of safeReaddir(d)) {
+    if (!f.endsWith(".jsonl")) continue;
+    try { files.push({ file: path.join(d, f), mtime: fs.statSync(path.join(d, f)).mtimeMs }); } catch {}
+  }
+  return files.sort((a, b) => b.mtime - a.mtime);
+}
+
+function readSessionMeta(file) {
+  const m = { id: path.basename(file, ".jsonl"), file, cwd: null, title: null, firstPrompt: null, turns: 0, mtime: 0 };
+  let text;
+  try { m.mtime = fs.statSync(file).mtimeMs; text = fs.readFileSync(file, "utf8"); } catch { return null; }
+  for (const line of text.split("\n")) {
+    if (!line) continue;
+    let d; try { d = JSON.parse(line); } catch { continue; }
+    if (d.type === "ai-title" && d.aiTitle) m.title = d.aiTitle;
+    else if (d.type === "user" && !d.isSidechain) {
+      const c = d.message?.content;
+      const txt = typeof c === "string" ? c
+        : Array.isArray(c) ? c.filter((x) => x && x.type === "text").map((x) => x.text).join(" ") : "";
+      if (!txt || txt.startsWith("<")) continue; // tool results and injected context, not the human
+      m.turns++;
+      if (!m.cwd && d.cwd) m.cwd = d.cwd;
+      if (!m.firstPrompt) m.firstPrompt = txt.replace(/\s+/g, " ").trim().slice(0, 120);
+    }
+  }
+  return m;
+}
+
+function sessionOwner(sessionId) {
+  return loadTasks().tasks.find((t) => t.kind === "session" && (t.sourceSession === sessionId || t.sessionId === sessionId));
+}
+
+function sessionAge(ms) {
+  const m = Math.round((Date.now() - ms) / 60000);
+  return m < 60 ? `${m}m ago` : m < 1440 ? `${Math.round(m / 60)}h ago` : `${Math.round(m / 1440)}d ago`;
+}
+
+function cmdSessions(rest) {
+  const all = rest.includes("--all");
+  const ni = rest.indexOf("-n");
+  const n = ni >= 0 ? parseInt(rest[ni + 1], 10) || 10 : 10;
+  const files = sessionFiles({ cwd: all ? null : process.cwd() }).slice(0, n);
+  if (!files.length) { console.log(`\n  no Claude sessions found${all ? "" : ` for ${process.cwd()} (try --all)`}\n`); return; }
+  console.log();
+  for (const { file } of files) {
+    const m = readSessionMeta(file); if (!m) continue;
+    const o = sessionOwner(m.id);
+    const label = (m.title || m.firstPrompt || "(untitled)").slice(0, 54).padEnd(54);
+    console.log(`  ${C.bold(m.id.slice(0, 8))}  ${label}  ${C.dim(`${sessionAge(m.mtime)} · ${m.turns} turns${o ? ` · trac ${o.id} (${o.status})` : ""}`)}`);
+  }
+  console.log(C.dim(`\n  hand one to trac: trac adopt <id>     (inside a session: trac adopt $CLAUDE_CODE_SESSION_ID)\n`));
+}
+
+function cmdAdopt(rest) {
+  const flags = ["--repo", "--budget", "-p", "--note"];
+  const flag = (name, dflt) => { const i = rest.indexOf(name); return i >= 0 ? rest[i + 1] : dflt; };
+  const positional = rest.filter((a, i) => !a.startsWith("-") && !flags.includes(rest[i - 1]));
+  const want = positional[0] || process.env.CLAUDE_CODE_SESSION_ID || null;
+  let file = null;
+  if (want) {
+    const hits = sessionFiles().filter((x) => path.basename(x.file, ".jsonl").startsWith(want));
+    if (!hits.length) { console.error(`  no Claude session starting with ${want}; see trac sessions --all`); process.exit(1); }
+    if (hits.length > 1) { console.error(`  ${hits.length} sessions start with ${want}; give more of the id`); process.exit(1); }
+    file = hits[0].file;
+  } else {
+    // No id and not inside a session: the newest transcript for this directory,
+    // unless several were active in the last 15 minutes (parallel sessions), then ask.
+    const files = sessionFiles({ cwd: process.cwd() });
+    if (!files.length) { console.error(`  no Claude sessions for ${process.cwd()}; see trac sessions --all`); process.exit(1); }
+    const recent = files.filter((x) => Date.now() - x.mtime < 15 * 60000);
+    if (recent.length > 1) {
+      console.error(`  ${recent.length} sessions were active here in the last 15 minutes; say which:`);
+      cmdSessions([]);
+      process.exit(1);
+    }
+    file = files[0].file;
+  }
+  const m = readSessionMeta(file);
+  if (!m) { console.error("  could not read that session's transcript"); process.exit(1); }
+  const owner = sessionOwner(m.id);
+  if (owner) { console.error(`  already with trac as ${owner.id} (${owner.status})`); process.exit(1); }
+  const repo = path.resolve(flag("--repo", m.cwd || process.cwd()));
+  if (!fs.existsSync(repo)) { console.error(`  no such directory: ${repo}`); process.exit(1); }
+  const title = m.title || m.firstPrompt || m.id.slice(0, 8);
+  const note = flag("--note", "");
+  const task = mutateTasks((db) => {
+    const t = {
+      id: "t" + db.nextId++,
+      kind: "session",
+      spec: title,
+      repo,
+      sourceSession: m.id,
+      priority: parseInt(flag("-p", "2"), 10) || 2,
+      budget: parseInt(flag("--budget", "25"), 10) || 25,
+      mode: "build",
+      push: false,
+      pr: false,
+      status: "queued",
+      createdAt: new Date().toISOString(),
+      reported: true,
+    };
+    if (note) t.note = note;
+    db.tasks.push(t);
+    return t;
+  });
+  console.log(`  ${C.bold(task.id)} now holds session ${C.bold(m.id.slice(0, 8))}: ${title.slice(0, 70)}`);
+  console.log(C.dim(`  it continues as a forked copy in ${repo} once the window has room and you have been idle ${IDLE_MIN} min`));
+  console.log(C.dim(`  leave that Claude session now; take the work back any time: trac release ${task.id}`));
 }
 
 // ── Idle detection ──────────────────────────────────────────────────────────
@@ -646,6 +788,8 @@ function ignoredProjects() {
 function recentHumanTranscripts(withinMin) {
   const cutoff = Date.now() - withinMin * 60000;
   const ignore = ignoredProjects();
+  // Adopted sessions are continued in the user's own project dir; their forks are trac's, not the human's.
+  const ours = new Set(loadTasks().tasks.map((t) => t.sessionId).filter(Boolean));
   for (const dir of safeReaddir(CLAUDE_DIR)) {
     if (dir.includes("-trac-work-")) continue; // our own headless runs
     if (ignore.includes(dir)) continue;        // sessions the user marked as non-work
@@ -653,7 +797,8 @@ function recentHumanTranscripts(withinMin) {
     try {
       if (!fs.statSync(full).isDirectory()) continue;
       for (const f of safeReaddir(full)) {
-        if (f.endsWith(".jsonl") && fs.statSync(path.join(full, f)).mtimeMs > cutoff) return true;
+        if (!f.endsWith(".jsonl") || ours.has(f.slice(0, -6))) continue;
+        if (fs.statSync(path.join(full, f)).mtimeMs > cutoff) return true;
       }
     } catch {}
   }
@@ -682,20 +827,28 @@ function defaultBase(repo) {
 async function dispatch(task, { dry = false, manual = false, fresh = false } = {}) {
   const db = loadTasks();
   const t = db.tasks.find((x) => x.id === task.id);
-  const branch = `trac/${t.id}-${slug(t.spec)}`;
-  const worktree = path.join(WORK_DIR, t.id);
+  // An adopted session (trac adopt) is not a spec in a worktree: it is the user's
+  // own conversation, continued in their own working tree as a forked copy.
+  const isSession = t.kind === "session";
+  const branch = isSession ? null : `trac/${t.id}-${slug(t.spec)}`;
+  const worktree = isSession ? null : path.join(WORK_DIR, t.id);
 
   // Resume when a prior attempt left a Claude session AND its worktree behind
   // (paused by quota, interrupted by the human, or a failed run being retried):
   // the branch keeps its commits, the agent keeps its conversation. `fresh`
   // (trac run --fresh, or the dashboard's Start over) wipes both.
-  const resuming = !fresh && !!t.sessionId && !!t.worktree && fs.existsSync(t.worktree) && !dry;
-  const base = resuming && t.base ? t.base : defaultBase(t.repo);
+  const resuming = !fresh && !!t.sessionId && !dry && (isSession || (!!t.worktree && fs.existsSync(t.worktree)));
+  const base = isSession ? null : resuming && t.base ? t.base : defaultBase(t.repo);
   const priorStatus = t.status;
 
   fs.mkdirSync(WORK_DIR, { recursive: true });
   fs.mkdirSync(REPORT_DIR, { recursive: true });
-  if (!resuming) {
+  if (isSession && !resuming) {
+    // The fork gets a fresh id; the source transcript stays exactly as the user left it.
+    t.sessionId = crypto.randomUUID();
+    t.attempts = 0;
+    delete t.windowPctUsed;
+  } else if (!resuming) {
     try { execSync(`git -C ${JSON.stringify(t.repo)} worktree remove --force ${JSON.stringify(worktree)}`, { stdio: "ignore" }); } catch {}
     execSync(`git -C ${JSON.stringify(t.repo)} worktree add -B ${branch} ${JSON.stringify(worktree)} ${base}`, { stdio: "ignore" });
     // Trac names the session so the id is known even if claude dies before printing.
@@ -729,6 +882,17 @@ async function dispatch(task, { dry = false, manual = false, fresh = false } = {
     ? `A prepared spec folder exists at ${specDir}. Read SPEC.md there FIRST and treat it ` +
       `as authoritative; asset files referenced by it are in that folder.\n\n`
     : "";
+  const sessionWrapper = !isSession ? null :
+    (resuming
+      ? `You are resuming again, unattended, after the previous run ${priorStatus === "paused" ? "was paused (the subscription window ran out, or its time slice ended)" : "was cut short"}. ` +
+        `Continue from exactly where you left off; do not redo finished work.\n\n`
+      : `The person you were working with in this conversation had to stop, and handed the rest to an unattended runner. ` +
+        `Continue the task you were working on until it is complete or you are genuinely blocked. When you finish, end with a short ` +
+        `summary of what changed; if you are blocked, end with exactly what you need from them.\n\n`) +
+    (t.note ? `Their note when handing off: ${t.note}\n\n` : "") +
+    `Rules: you are running unattended in ${t.repo}, the person's own working tree. Work only inside that directory. ` +
+    `Do not run git push, and do not commit unless the conversation already asked you to. Nobody can answer questions ` +
+    `until they are back, so make reasonable choices and record them in your summary.`;
   const resumeNote = resuming
     ? `You are RESUMING this task. A previous attempt was ${priorStatus === "paused" ? "paused because the subscription quota ran out" : priorStatus === "interrupted" ? "interrupted" : "cut short"}. ` +
       `Everything you did so far is on this branch: run git log ${base}..HEAD and git status before anything else, ` +
@@ -748,21 +912,35 @@ async function dispatch(task, { dry = false, manual = false, fresh = false } = {
     ? "Read,Glob,Grep,LS,Bash(git log:*),Bash(git diff:*),Bash(git show:*),Write(REPORT.md),Bash(git add:*),Bash(git commit:*)"
     : "Edit,Write,Read,Glob,Grep,LS,NotebookEdit,Bash";
 
+  // While claude runs, its pid sits on the record so `trac release` / Remove can stop it.
+  const onSpawn = (pid) => mutateTasks((fresh) => { const ft = fresh.tasks.find((x) => x.id === task.id); if (ft) ft.pid = pid; });
+
   let result = { ok: false, summary: "", turns: 0 };
-  if (dry) {
+  if (dry && isSession) {
+    result = { ok: true, summary: "(dry run — no Claude invocation)", turns: 0 };
+  } else if (dry) {
     fs.writeFileSync(path.join(worktree, "DRYRUN.md"), `dry run for ${t.id}\n`);
     execSync(`git -C ${JSON.stringify(worktree)} add -A && git -C ${JSON.stringify(worktree)} commit -qm "trac dry run"`, { stdio: "ignore", shell: "/bin/zsh" });
     result = { ok: true, summary: "(dry run — no Claude invocation)", turns: 0 };
+  } else if (isSession) {
+    result = await runClaude(sessionWrapper, t.repo, tools, "build", {
+      manual, sessionId: t.sessionId, resume: resuming, forkFrom: resuming ? null : t.sourceSession, onSpawn,
+    });
   } else {
-    result = await runClaude(wrapper, worktree, tools, t.mode, { manual, sessionId: t.sessionId, resume: resuming });
+    result = await runClaude(wrapper, worktree, tools, t.mode, { manual, sessionId: t.sessionId, resume: resuming, onSpawn });
   }
 
-  const commits = parseInt(execSync(
-    `git -C ${JSON.stringify(worktree)} rev-list --count ${base}..${branch}`,
-    { stdio: ["ignore", "pipe", "ignore"] }).toString().trim(), 10) || 0;
+  let commits = 0;
+  if (!isSession) {
+    try {
+      commits = parseInt(execSync(
+        `git -C ${JSON.stringify(worktree)} rev-list --count ${base}..${branch}`,
+        { stdio: ["ignore", "pipe", "ignore"] }).toString().trim(), 10) || 0;
+    } catch {} // worktree gone (removed while running): nothing to count
+  }
 
-  const reportSrc = path.join(worktree, "REPORT.md");
-  if (t.mode === "analyze" && fs.existsSync(reportSrc)) {
+  const reportSrc = isSession ? null : path.join(worktree, "REPORT.md");
+  if (reportSrc && t.mode === "analyze" && fs.existsSync(reportSrc)) {
     fs.copyFileSync(reportSrc, path.join(REPORT_DIR, `${t.id}.md`));
     t.report = path.join(REPORT_DIR, `${t.id}.md`);
   }
@@ -776,24 +954,27 @@ async function dispatch(task, { dry = false, manual = false, fresh = false } = {
   // Did the run stop because the window ran out? Either claude said so, or the
   // live gauge reads capped right after a failure. Then the task is paused, not
   // failed: the daemon resumes it once the window resets and the reserve fits.
-  const finished = result.ok && (commits > 0 || t.mode === "analyze");
+  const finished = result.ok && (isSession || commits > 0 || t.mode === "analyze");
   const quotaHit = !dry && !result.interrupted && !finished &&
     (QUOTA_RE.test(`${result.error || ""} ${result.summary || ""}`) ||
      (quotaAfter && quotaAfter.five_hour.utilization >= 99));
-  const canResume = quotaHit && t.attempts <= RESUME_MAX;
+  // An adopted session has no spec to fail against: when its time slice or turn
+  // budget runs out it simply pauses and continues in the next slice.
+  const sliceEnded = isSession && !finished && !result.interrupted && (result.timedOut || result.subtype === "error_max_turns");
+  const canResume = (quotaHit || sliceEnded) && t.attempts <= RESUME_MAX;
 
   t.commits = commits;
   t.summary = (result.summary || "").slice(0, 400);
   t.endedAt = new Date().toISOString();
   t.status = result.interrupted ? "interrupted" : canResume ? "paused" : finished ? "done" : "failed";
   if (!result.ok && result.error) t.error = result.error.slice(0, 200);
-  if (quotaHit && !canResume) t.error = `paused ${RESUME_MAX} times by quota and still not done, giving up`;
+  if ((quotaHit || sliceEnded) && !canResume) t.error = `paused ${RESUME_MAX} times and still not done, giving up`;
   if (t.status === "paused") { t.pausedAt = t.endedAt; delete t.error; } else delete t.pausedAt;
   t.reported = t.status === "paused"; // a pause is transient, not a morning item
 
   // Nothing the agent wrote is lost while it waits: snapshot uncommitted edits
   // onto the branch so a later fresh start or a review sees them.
-  if ((t.status === "paused" || t.status === "interrupted") && !dry) {
+  if ((t.status === "paused" || t.status === "interrupted") && !dry && !isSession) {
     try {
       if (execSync(`git -C ${JSON.stringify(worktree)} status --porcelain`, { stdio: ["ignore", "pipe", "ignore"] }).toString().trim()) {
         execSync(`git -C ${JSON.stringify(worktree)} add -A && git -C ${JSON.stringify(worktree)} -c user.name=trac -c user.email=trac@local commit -q --no-verify -m ${JSON.stringify(`trac: checkpoint, ${t.status} after attempt ${t.attempts}`)}`, { stdio: "ignore", shell: "/bin/zsh" });
@@ -822,7 +1003,7 @@ async function dispatch(task, { dry = false, manual = false, fresh = false } = {
     ft.commits = t.commits; ft.summary = t.summary; ft.endedAt = t.endedAt;
     ft.status = t.status; ft.reported = t.reported;
     ft.branch = t.branch; ft.worktree = t.worktree; ft.base = t.base;
-    ft.sessionId = t.sessionId; ft.attempts = t.attempts;
+    ft.sessionId = t.sessionId; ft.attempts = t.attempts; delete ft.pid;
     if (t.pausedAt) ft.pausedAt = t.pausedAt; else delete ft.pausedAt;
     if (t.error !== undefined) ft.error = t.error; else delete ft.error;
     if (t.report) ft.report = t.report;
@@ -855,14 +1036,18 @@ function claudeBin() {
 }
 
 // Headless Claude with wall-clock timeout and stop-on-human-activity
-function runClaude(prompt, cwd, tools, mode, { manual = false, timeoutMin = TASK_TIMEOUT_MIN, maxTurns = 60, sessionId = null, resume = false } = {}) {
+function runClaude(prompt, cwd, tools, mode, { manual = false, timeoutMin = TASK_TIMEOUT_MIN, maxTurns = 60, sessionId = null, resume = false, forkFrom = null, onSpawn = null } = {}) {
   return new Promise((resolve) => {
     const args = ["-p", prompt, "--output-format", "json", "--max-turns", String(maxTurns), "--allowedTools", tools];
     if (mode === "build") args.push("--permission-mode", "acceptEdits");
     // First attempt names the session; later attempts continue it with full context.
-    if (sessionId) args.push(resume ? "--resume" : "--session-id", sessionId);
+    // An adopted session is forked on its first attempt, so the user's own copy of
+    // the conversation is never written to.
+    if (forkFrom && sessionId) args.push("--resume", forkFrom, "--fork-session", "--session-id", sessionId);
+    else if (sessionId) args.push(resume ? "--resume" : "--session-id", sessionId);
     const child = spawn(claudeBin(), args, { cwd, stdio: ["ignore", "pipe", "pipe"], shell: false });
-    let out = "", err = "", finished = false, interrupted = false;
+    if (onSpawn) { try { onSpawn(child.pid); } catch {} }
+    let out = "", err = "", finished = false, interrupted = false, timedOut = false;
     child.stdout.on("data", (d) => (out += d));
     child.stderr.on("data", (d) => (err += d));
     // Scheduler-dispatched runs yield to the human; manual runs don't —
@@ -873,16 +1058,16 @@ function runClaude(prompt, cwd, tools, mode, { manual = false, timeoutMin = TASK
         child.kill("SIGTERM");
       }
     }, 60000);
-    const timeout = setTimeout(() => child.kill("SIGTERM"), timeoutMin * 60000);
+    const timeout = setTimeout(() => { timedOut = true; child.kill("SIGTERM"); }, timeoutMin * 60000);
     child.on("close", () => {
       if (finished) return;
       finished = true;
       if (killer) clearInterval(killer); clearTimeout(timeout);
       try {
         const j = JSON.parse(out);
-        resolve({ ok: !j.is_error, summary: j.result || "", turns: j.num_turns || 0, interrupted });
+        resolve({ ok: !j.is_error, summary: j.result || "", turns: j.num_turns || 0, interrupted, timedOut, subtype: j.subtype || "" });
       } catch {
-        resolve({ ok: false, error: (err || out).slice(-300) || "no output", interrupted });
+        resolve({ ok: false, error: (err || out).slice(-300) || "no output", interrupted, timedOut });
       }
     });
     child.on("error", (e) => {
@@ -919,11 +1104,15 @@ async function cmdRun(rest) {
     task = pickTask(dry ? 0 : sessionPct);
     if (!task) { console.log("  nothing runnable (queue empty, or no task fits current headroom)"); return; }
   }
-  const willResume = !fresh && task.sessionId && task.worktree && fs.existsSync(task.worktree);
+  const willResume = !fresh && task.sessionId && (task.kind === "session" || (task.worktree && fs.existsSync(task.worktree)));
   console.log(`  ${willResume ? "resuming" : "dispatching"} ${C.bold(task.id)}${dry ? " (dry)" : ""}${fresh ? " (fresh)" : ""}: ${titleOf(task).slice(0, 70)}`);
   const t = await dispatch(task, { dry, manual: true, fresh });
-  const line = t.status === "done"
+  const line = t.status === "done" && t.kind === "session"
+    ? `done${t.windowPctUsed != null ? ` · ${t.windowPctUsed}% window used` : ""} — continue it: claude --resume ${t.sessionId}`
+    : t.status === "done"
     ? `done — ${t.commits} commit(s) on ${t.branch}${t.windowPctUsed != null ? ` · ${t.windowPctUsed}% window used` : ""}${t.prUrl ? ` · ${t.prUrl}` : ""}`
+    : t.status === "paused" && t.kind === "session"
+    ? `paused after attempt ${t.attempts}; continues in the next slice with room`
     : t.status === "paused"
     ? `paused — quota exhausted after attempt ${t.attempts}; ${t.commits} commit(s) kept on ${t.branch}, resumes when the window resets`
     : `${t.status}${t.error ? ` — ${t.error}` : ""}`;
@@ -1008,6 +1197,11 @@ function cmdMorning() {
   for (const t of unreported) {
     if (t.status === "done") {
       console.log(`  ${C.green("●")} ${C.bold(t.id)} ${titleOf(t).slice(0, 60)}`);
+      if (t.kind === "session") {
+        if (t.summary) console.log(C.dim(`     ${t.summary.replace(/\s+/g, " ").slice(0, 200)}`));
+        console.log(C.dim(`     continue it: claude --resume ${t.sessionId}${t.windowPctUsed != null ? ` · ${t.windowPctUsed}% window` : ""}`));
+        continue;
+      }
       console.log(`     ${t.commits} commit(s) on ${C.bold(t.branch)}${t.windowPctUsed != null ? C.dim(` · ${t.windowPctUsed}% window`) : ""}${t.prUrl ? `\n     PR: ${t.prUrl}` : ""}`);
       if (t.report) console.log(C.dim(`     report: ${t.report}`));
       console.log(C.dim(`     review: git -C ${t.repo} diff ${t.base}..${t.branch}`));
@@ -1122,6 +1316,7 @@ function uiAction(id, action) {
         t.revertedAt = Date.now();
         return { ok: true };
       } else if (action === "discard") {
+        stopTask(t);
         if (t.worktree) { try { g(`git -C ${JSON.stringify(t.repo)} worktree remove --force ${JSON.stringify(t.worktree)}`); } catch {} }
         if (t.branch) { try { g(`git -C ${JSON.stringify(t.repo)} branch -D ${t.branch}`); } catch {} }
         db.tasks = db.tasks.filter((x) => x.id !== id);
@@ -1329,10 +1524,13 @@ function render() {
 }
 function card(t) {
   const b = [];
-  if (t.status === "queued") b.push(btn(t, "run", "Run now", "primary"), btn(t, "defer", "Defer"), btn(t, "discard", "Remove", "danger"));
+  const isS = t.kind === "session";
+  if (t.status === "queued") b.push(btn(t, "run", "Run now", "primary"), btn(t, "defer", "Defer"), btn(t, "discard", isS ? "Release" : "Remove", "danger"));
+  if (t.status === "running" && isS) b.push(btn(t, "discard", "Release", "danger"));
   if (t.status === "paused") b.push(btn(t, "run", "Resume now", "primary"), btn(t, "defer", "Defer"), btn(t, "restart", "Start over"), btn(t, "discard", "Remove", "danger"));
   if (t.status === "deferred") b.push(btn(t, "requeue", "Requeue", "primary"), btn(t, "discard", "Remove", "danger"));
-  if (t.status === "done") {
+  if (t.status === "done" && isS) b.push(btn(t, "discard", "Dismiss"));
+  if (t.status === "done" && !isS) {
     b.push(btn(t, "merge", "Merge", "primary"));
     b.push('<button onclick="toggle(\\'' + t.id + '\\',\\'diff\\')">Diff</button>');
     if (t.report) b.push('<button onclick="toggle(\\'' + t.id + '\\',\\'report\\')">Report</button>');
@@ -1344,7 +1542,8 @@ function card(t) {
     b.push(btn(t, "discard", "Dismiss"));
   }
   if (t.status === "reverted") b.push(btn(t, "discard", "Dismiss"));
-  const meta = [t.repo.split("/").pop(), t.mode, "p" + t.priority,
+  const meta = [t.repo.split("/").pop(), isS ? "session" : t.mode, "p" + t.priority,
+    isS && (t.sessionId || t.sourceSession) ? "<code>claude --resume " + (t.sessionId || t.sourceSession) + "</code>" : null,
     t.commits ? t.commits + " commits" : null,
     t.mergeCommit ? "merged " + t.mergeCommit.slice(0, 7) : null,
     t.revertCommit ? "reverted " + t.revertCommit.slice(0, 7) : null,
@@ -1395,6 +1594,9 @@ else if (cmd === "export") cmdExport(events, days);
 else if (cmd === "add") await cmdTaskAdd(rest);
 else if (cmd === "tasks") cmdTaskList();
 else if (cmd === "rm") cmdTaskRm(rest[0]);
+else if (cmd === "release") cmdTaskRm(rest[0], { release: true });
+else if (cmd === "adopt") cmdAdopt(rest);
+else if (cmd === "sessions") cmdSessions(rest);
 else if (cmd === "run") await cmdRun(rest);
 else if (cmd === "daemon-tick") await cmdDaemonTick(events);
 else if (cmd === "daemon") cmdDaemon(rest);
@@ -1405,6 +1607,7 @@ else {
   trac status | report [--days N] | json | export [--days N]
   trac add "<spec>" [--repo <path>] [-p N] [--budget N] [--analyze] [--push] [--pr] [--prep]
   trac tasks | rm <id> | run [id] [--dry] [--fresh] | morning
+  trac sessions [--all] [-n N] | adopt [session-id] [--repo <path>] [--budget N] [-p N] [--note "..."] | release <id>
   trac daemon [uninstall]`);
   process.exit(1);
 }

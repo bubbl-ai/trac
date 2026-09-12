@@ -42,6 +42,20 @@ Prep moves the intelligence to `trac add`:
 - [ ] later: source-specific enrichers (Figma MCP, error-log gathering for bug
       tasks, repo-context summaries).
 
+## M3.6 — Session handoff ("send my session to trac")
+The runner stops being only for specs: the conversation you were in becomes the task.
+- [x] **pause and resume** — a run that dies to the window limit pauses instead of
+      failing; the daemon resumes the same Claude session (`--resume`) when the
+      reserve fits, three pauses max, uncommitted work checkpointed on the branch
+- [x] **adopt / release** — `trac adopt` takes an interactive session over as a
+      forked copy (the original is never written to); `trac release` hands it back
+      with the `claude --resume` command; `/trac` slash command, or
+      `! trac adopt $CLAUDE_CODE_SESSION_ID` once the limit has hit
+- [x] **auto-continue** — an adopted session runs under the normal gates, in the
+      user's working tree; limit, time slice and turn budget all pause rather than fail
+- [ ] later: auto-adopt (opt-in per repo: a session that hits the limit there is
+      picked up without a handoff)
+
 ## M4 — Distribution
 - [ ] **compiled no-Node binary** (`bun build --compile`) — removes the Node 18+ ask
 - [ ] **Linux/Windows** — credentials paths + notification equivalents
