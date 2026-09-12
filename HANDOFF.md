@@ -53,5 +53,3 @@ The compiled binary is not in this zip — build it from source with the above.
   to transcript estimates.
 - `trac.js` in this zip includes work that was uncommitted in Tony's tree at
   package time (the M3.5 task-prep pass) — it's ahead of the last commit.
-- The README's "Roadmap" section is stale: the task backlog and scheduler
-  described there as future work are now built.
