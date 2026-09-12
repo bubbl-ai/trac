@@ -70,6 +70,7 @@ trac rm t3                 # delete a task, its prep folder, and its worktree
 trac run                   # run the next runnable task now, ignoring the idle gate
 trac run t3                # run a specific task
 trac run t3 --dry          # exercise the worktree flow without calling Claude
+trac run t3 --fresh        # start a paused or failed task over, discarding its session and branch
 trac morning               # what finished while you were away, marked as read
 trac ui                    # browser dashboard at http://localhost:7433
 ```
@@ -90,7 +91,7 @@ Every task runs headless in its own git worktree at `~/.trac/work/<id>` on a bra
 `trac/<id>-<slug>`, cut from the repo's default branch. Your working tree and history are
 never touched. Nothing is pushed unless the task was added with `--push` or `--pr`, and PRs
 are always drafts. When a task finishes, review it with the command `trac morning` prints,
-or merge, revert, defer, requeue and discard it from the dashboard.
+or merge, revert, defer, requeue, start over and discard it from the dashboard.
 
 ### The scheduler
 
@@ -109,6 +110,23 @@ The daemon dispatches one task only when every gate passes:
 A running task is killed the moment you become active and is hard-capped at 30 minutes.
 `trac run` bypasses the idle gate and warns instead of refusing when a task would breach
 the reserve, because you are at the keyboard to decide.
+
+### Running out of quota mid-task
+
+A task that dies because the 5-hour window ran out is **paused**, not failed. Trac keeps
+its worktree and branch, commits any edits the agent left uncommitted as a checkpoint,
+and remembers the Claude session. When the window resets and the reserve gate fits
+again, the daemon resumes paused tasks ahead of new ones by continuing that same session
+with `claude --resume`, so the agent picks up its own conversation and the commits it
+already made rather than starting over. `trac tasks` shows a paused task as ◔ with its
+attempt count. A task paused three times and still not done is marked failed.
+
+Trac detects the pause two ways: the run's error text names a usage or rate limit, or the
+live gauge reads capped right after a failure. A task interrupted because you came back
+to the keyboard, or one that failed for any other reason, is not resumed automatically,
+but retrying it with `trac run` or the dashboard's Resume button continues the same
+session too. `trac run <id> --fresh` or the dashboard's Start over button discards the
+session and the branch and begins again from the spec.
 
 ## Menu bar gauge
 

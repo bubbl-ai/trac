@@ -8,6 +8,7 @@ import path from "node:path";
 import os from "node:os";
 import readline from "node:readline";
 import { execSync } from "node:child_process";
+import crypto from "node:crypto";
 
 const CLAUDE_DIR = path.join(os.homedir(), ".claude", "projects");
 const WINDOW_MS = 5 * 60 * 60 * 1000; // subscription quota window
@@ -486,6 +487,9 @@ const RESERVE_PCT = 75;      // never take the session window past this
 const WEEK_MAX_PCT = 90;     // stop background work near the weekly cap
 const IDLE_MIN = 15;         // human must be idle this long before dispatch
 const TASK_TIMEOUT_MIN = 30; // hard wall-clock cap per task
+const RESUME_MAX = 3;        // a task paused by quota is resumed at most this many times
+// What a `claude -p` run says when the subscription window is exhausted.
+const QUOTA_RE = /hit your limit|usage limit|limit reached|rate.?limit|out of (?:extra )?usage|resets (?:at|in) /i;
 
 function loadTasks() { return loadState("tasks.json", { nextId: 1, tasks: [] }); }
 function saveTasks(db) { saveState("tasks.json", db); }
@@ -600,9 +604,10 @@ function cmdTaskList() {
   if (!db.tasks.length) { console.log("\n  no tasks — add one: trac add \"...\" --repo <path>\n"); return; }
   console.log();
   for (const t of db.tasks) {
-    const icons = { queued: "○", running: "◐", done: "●", failed: "✗", interrupted: "◑", skipped: "–" };
+    const icons = { queued: "○", running: "◐", done: "●", failed: "✗", interrupted: "◑", paused: "◔", skipped: "–" };
     const extra = t.status === "done" ? ` → ${t.branch}${t.commits ? ` (${t.commits} commits)` : ""}` :
-                  t.status === "failed" ? ` — ${t.error || "failed"}` : "";
+                  t.status === "failed" ? ` — ${t.error || "failed"}` :
+                  t.status === "paused" ? ` — paused, quota exhausted; resumes when the window resets (attempt ${t.attempts || 1})` : "";
     console.log(`  ${icons[t.status] || "?"} ${C.bold(t.id.padEnd(4))} [${t.mode}, p${t.priority}] ${path.basename(t.repo)}: ${titleOf(t).slice(0, 70)}${extra ? C.dim(extra) : ""}`);
   }
   console.log();
@@ -674,17 +679,31 @@ function defaultBase(repo) {
   return "HEAD";
 }
 
-async function dispatch(task, { dry = false, manual = false } = {}) {
+async function dispatch(task, { dry = false, manual = false, fresh = false } = {}) {
   const db = loadTasks();
   const t = db.tasks.find((x) => x.id === task.id);
   const branch = `trac/${t.id}-${slug(t.spec)}`;
   const worktree = path.join(WORK_DIR, t.id);
-  const base = defaultBase(t.repo);
+
+  // Resume when a prior attempt left a Claude session AND its worktree behind
+  // (paused by quota, interrupted by the human, or a failed run being retried):
+  // the branch keeps its commits, the agent keeps its conversation. `fresh`
+  // (trac run --fresh, or the dashboard's Start over) wipes both.
+  const resuming = !fresh && !!t.sessionId && !!t.worktree && fs.existsSync(t.worktree) && !dry;
+  const base = resuming && t.base ? t.base : defaultBase(t.repo);
+  const priorStatus = t.status;
 
   fs.mkdirSync(WORK_DIR, { recursive: true });
   fs.mkdirSync(REPORT_DIR, { recursive: true });
-  try { execSync(`git -C ${JSON.stringify(t.repo)} worktree remove --force ${JSON.stringify(worktree)}`, { stdio: "ignore" }); } catch {}
-  execSync(`git -C ${JSON.stringify(t.repo)} worktree add -B ${branch} ${JSON.stringify(worktree)} ${base}`, { stdio: "ignore" });
+  if (!resuming) {
+    try { execSync(`git -C ${JSON.stringify(t.repo)} worktree remove --force ${JSON.stringify(worktree)}`, { stdio: "ignore" }); } catch {}
+    execSync(`git -C ${JSON.stringify(t.repo)} worktree add -B ${branch} ${JSON.stringify(worktree)} ${base}`, { stdio: "ignore" });
+    // Trac names the session so the id is known even if claude dies before printing.
+    t.sessionId = crypto.randomUUID();
+    t.attempts = 0;
+    delete t.windowPctUsed;
+  }
+  t.attempts = (t.attempts || 0) + 1;
 
   t.status = "running"; t.branch = branch; t.worktree = worktree; t.base = base;
   t.startedAt = new Date().toISOString();
@@ -693,7 +712,8 @@ async function dispatch(task, { dry = false, manual = false } = {}) {
     const ft = fresh.tasks.find((x) => x.id === task.id);
     if (!ft) return;
     ft.status = "running"; ft.branch = branch; ft.worktree = worktree; ft.base = base;
-    ft.startedAt = t.startedAt;
+    ft.startedAt = t.startedAt; ft.sessionId = t.sessionId; ft.attempts = t.attempts;
+    if (!resuming) delete ft.windowPctUsed;
     delete ft.error; delete ft.summary;
   });
 
@@ -709,7 +729,13 @@ async function dispatch(task, { dry = false, manual = false } = {}) {
     ? `A prepared spec folder exists at ${specDir}. Read SPEC.md there FIRST and treat it ` +
       `as authoritative; asset files referenced by it are in that folder.\n\n`
     : "";
+  const resumeNote = resuming
+    ? `You are RESUMING this task. A previous attempt was ${priorStatus === "paused" ? "paused because the subscription quota ran out" : priorStatus === "interrupted" ? "interrupted" : "cut short"}. ` +
+      `Everything you did so far is on this branch: run git log ${base}..HEAD and git status before anything else, ` +
+      `then continue from where you left off. Do not start over and do not redo committed work.\n\n`
+    : "";
   const wrapper =
+    resumeNote +
     specNote +
     `${t.spec}\n\n` +
     `Rules: you are running unattended in a dedicated git worktree (${worktree}) on branch ${branch}. ` +
@@ -728,7 +754,7 @@ async function dispatch(task, { dry = false, manual = false } = {}) {
     execSync(`git -C ${JSON.stringify(worktree)} add -A && git -C ${JSON.stringify(worktree)} commit -qm "trac dry run"`, { stdio: "ignore", shell: "/bin/zsh" });
     result = { ok: true, summary: "(dry run — no Claude invocation)", turns: 0 };
   } else {
-    result = await runClaude(wrapper, worktree, tools, t.mode, { manual });
+    result = await runClaude(wrapper, worktree, tools, t.mode, { manual, sessionId: t.sessionId, resume: resuming });
   }
 
   const commits = parseInt(execSync(
@@ -743,15 +769,38 @@ async function dispatch(task, { dry = false, manual = false } = {}) {
 
   const quotaAfter = await fetchQuota();
   if (quotaBefore && quotaAfter) {
-    t.windowPctUsed = Math.max(0, Math.round(quotaAfter.five_hour.utilization - quotaBefore.five_hour.utilization));
+    const used = Math.max(0, Math.round(quotaAfter.five_hour.utilization - quotaBefore.five_hour.utilization));
+    t.windowPctUsed = (resuming ? t.windowPctUsed || 0 : 0) + used;
   }
+
+  // Did the run stop because the window ran out? Either claude said so, or the
+  // live gauge reads capped right after a failure. Then the task is paused, not
+  // failed: the daemon resumes it once the window resets and the reserve fits.
+  const finished = result.ok && (commits > 0 || t.mode === "analyze");
+  const quotaHit = !dry && !result.interrupted && !finished &&
+    (QUOTA_RE.test(`${result.error || ""} ${result.summary || ""}`) ||
+     (quotaAfter && quotaAfter.five_hour.utilization >= 99));
+  const canResume = quotaHit && t.attempts <= RESUME_MAX;
 
   t.commits = commits;
   t.summary = (result.summary || "").slice(0, 400);
   t.endedAt = new Date().toISOString();
-  t.status = result.interrupted ? "interrupted" : (result.ok && (commits > 0 || t.mode === "analyze")) ? "done" : "failed";
+  t.status = result.interrupted ? "interrupted" : canResume ? "paused" : finished ? "done" : "failed";
   if (!result.ok && result.error) t.error = result.error.slice(0, 200);
-  t.reported = false;
+  if (quotaHit && !canResume) t.error = `paused ${RESUME_MAX} times by quota and still not done, giving up`;
+  if (t.status === "paused") { t.pausedAt = t.endedAt; delete t.error; } else delete t.pausedAt;
+  t.reported = t.status === "paused"; // a pause is transient, not a morning item
+
+  // Nothing the agent wrote is lost while it waits: snapshot uncommitted edits
+  // onto the branch so a later fresh start or a review sees them.
+  if ((t.status === "paused" || t.status === "interrupted") && !dry) {
+    try {
+      if (execSync(`git -C ${JSON.stringify(worktree)} status --porcelain`, { stdio: ["ignore", "pipe", "ignore"] }).toString().trim()) {
+        execSync(`git -C ${JSON.stringify(worktree)} add -A && git -C ${JSON.stringify(worktree)} -c user.name=trac -c user.email=trac@local commit -q --no-verify -m ${JSON.stringify(`trac: checkpoint, ${t.status} after attempt ${t.attempts}`)}`, { stdio: "ignore", shell: "/bin/zsh" });
+        t.commits = commits + 1;
+      }
+    } catch {}
+  }
 
   if (t.status === "done" && t.push && commits > 0 && !dry) {
     try {
@@ -771,8 +820,10 @@ async function dispatch(task, { dry = false, manual = false } = {}) {
     const ft = fresh.tasks.find((x) => x.id === task.id);
     if (!ft) return;
     ft.commits = t.commits; ft.summary = t.summary; ft.endedAt = t.endedAt;
-    ft.status = t.status; ft.reported = false;
+    ft.status = t.status; ft.reported = t.reported;
     ft.branch = t.branch; ft.worktree = t.worktree; ft.base = t.base;
+    ft.sessionId = t.sessionId; ft.attempts = t.attempts;
+    if (t.pausedAt) ft.pausedAt = t.pausedAt; else delete ft.pausedAt;
     if (t.error !== undefined) ft.error = t.error; else delete ft.error;
     if (t.report) ft.report = t.report;
     if (t.windowPctUsed != null) ft.windowPctUsed = t.windowPctUsed;
@@ -804,10 +855,12 @@ function claudeBin() {
 }
 
 // Headless Claude with wall-clock timeout and stop-on-human-activity
-function runClaude(prompt, cwd, tools, mode, { manual = false, timeoutMin = TASK_TIMEOUT_MIN, maxTurns = 60 } = {}) {
+function runClaude(prompt, cwd, tools, mode, { manual = false, timeoutMin = TASK_TIMEOUT_MIN, maxTurns = 60, sessionId = null, resume = false } = {}) {
   return new Promise((resolve) => {
     const args = ["-p", prompt, "--output-format", "json", "--max-turns", String(maxTurns), "--allowedTools", tools];
     if (mode === "build") args.push("--permission-mode", "acceptEdits");
+    // First attempt names the session; later attempts continue it with full context.
+    if (sessionId) args.push(resume ? "--resume" : "--session-id", sessionId);
     const child = spawn(claudeBin(), args, { cwd, stdio: ["ignore", "pipe", "pipe"], shell: false });
     let out = "", err = "", finished = false, interrupted = false;
     child.stdout.on("data", (d) => (out += d));
@@ -843,19 +896,22 @@ function runClaude(prompt, cwd, tools, mode, { manual = false, timeoutMin = TASK
 
 function pickTask(sessionPct) {
   const db = loadTasks();
+  // A paused task is half done and holds a worktree: finish it before starting new work.
+  const rank = (t) => (t.status === "paused" ? 0 : 1);
   return db.tasks
-    .filter((t) => t.status === "queued" && sessionPct + t.budget <= RESERVE_PCT)
-    .sort((a, b) => a.priority - b.priority || a.id.localeCompare(b.id))[0];
+    .filter((t) => (t.status === "queued" || t.status === "paused") && sessionPct + t.budget <= RESERVE_PCT)
+    .sort((a, b) => rank(a) - rank(b) || a.priority - b.priority || a.id.localeCompare(b.id))[0];
 }
 
 async function cmdRun(rest) {
   const dry = rest.includes("--dry");
+  const fresh = rest.includes("--fresh");
   const id = rest.find((a) => /^t\d+$/.test(a));
   const quota = await fetchQuota();
   const sessionPct = quota ? quota.five_hour.utilization : 100;
   let task;
   if (id) {
-    task = loadTasks().tasks.find((t) => t.id === id && (t.status === "queued" || t.status === "interrupted" || t.status === "failed"));
+    task = loadTasks().tasks.find((t) => t.id === id && ["queued", "paused", "interrupted", "failed"].includes(t.status));
     if (!task) { console.error(`no runnable task ${id}`); process.exit(1); }
     if (!dry && sessionPct + task.budget > RESERVE_PCT)
       console.log(C.orange(`  warning: session at ${Math.round(sessionPct)}%, task budget ${task.budget}% breaches the ${RESERVE_PCT}% reserve — running anyway (manual)`));
@@ -863,12 +919,15 @@ async function cmdRun(rest) {
     task = pickTask(dry ? 0 : sessionPct);
     if (!task) { console.log("  nothing runnable (queue empty, or no task fits current headroom)"); return; }
   }
-  console.log(`  dispatching ${C.bold(task.id)}${dry ? " (dry)" : ""}: ${titleOf(task).slice(0, 70)}`);
-  const t = await dispatch(task, { dry, manual: true });
+  const willResume = !fresh && task.sessionId && task.worktree && fs.existsSync(task.worktree);
+  console.log(`  ${willResume ? "resuming" : "dispatching"} ${C.bold(task.id)}${dry ? " (dry)" : ""}${fresh ? " (fresh)" : ""}: ${titleOf(task).slice(0, 70)}`);
+  const t = await dispatch(task, { dry, manual: true, fresh });
   const line = t.status === "done"
     ? `done — ${t.commits} commit(s) on ${t.branch}${t.windowPctUsed != null ? ` · ${t.windowPctUsed}% window used` : ""}${t.prUrl ? ` · ${t.prUrl}` : ""}`
+    : t.status === "paused"
+    ? `paused — quota exhausted after attempt ${t.attempts}; ${t.commits} commit(s) kept on ${t.branch}, resumes when the window resets`
     : `${t.status}${t.error ? ` — ${t.error}` : ""}`;
-  console.log(`  ${t.status === "done" ? C.green(line) : C.red(line)}`);
+  console.log(`  ${t.status === "done" ? C.green(line) : t.status === "paused" ? C.orange(line) : C.red(line)}`);
   if (t.report) console.log(C.dim(`  report: ${t.report}`));
 }
 
@@ -969,7 +1028,7 @@ const UI_PORT = 7433;
 function taskCounts() {
   const ts = loadTasks().tasks;
   return {
-    queued: ts.filter((t) => t.status === "queued").length,
+    queued: ts.filter((t) => t.status === "queued" || t.status === "paused").length,
     running: ts.filter((t) => t.status === "running").length,
     done: ts.filter((t) => t.status === "done").length,
   };
@@ -1014,7 +1073,7 @@ function uiAction(id, action) {
   if (action === "run") {
     const t = loadTasks().tasks.find((x) => x.id === id);
     if (!t) return { ok: false, error: "no such task" };
-    if (!["queued", "deferred", "failed", "interrupted"].includes(t.status))
+    if (!["queued", "paused", "deferred", "failed", "interrupted"].includes(t.status))
       return { ok: false, error: `cannot run a ${t.status} task` };
     const child = spawn(process.execPath, [new URL(import.meta.url).pathname, "run", t.id], { detached: true, stdio: "ignore" });
     child.unref();
@@ -1027,9 +1086,14 @@ function uiAction(id, action) {
     const t = db.tasks.find((x) => x.id === id);
     if (!t) return { ok: false, error: "no such task" };
     try {
-      if (action === "defer" && ["queued", "failed", "interrupted"].includes(t.status)) t.status = "deferred";
-      else if (action === "requeue" && ["deferred", "failed", "interrupted", "discarded"].includes(t.status)) {
-        t.status = "queued"; delete t.error;
+      if (action === "defer" && ["queued", "paused", "failed", "interrupted"].includes(t.status)) t.status = "deferred";
+      else if (action === "requeue" && ["deferred", "paused", "failed", "interrupted", "discarded"].includes(t.status)) {
+        t.status = "queued"; delete t.error; // keeps sessionId + worktree, so the next run resumes
+      } else if (action === "restart" && ["deferred", "paused", "failed", "interrupted", "discarded"].includes(t.status)) {
+        // Start over: drop the conversation and the branch's partial work.
+        if (t.worktree) { try { g(`git -C ${JSON.stringify(t.repo)} worktree remove --force ${JSON.stringify(t.worktree)}`); } catch {} delete t.worktree; }
+        delete t.sessionId; delete t.attempts; delete t.error; delete t.pausedAt;
+        t.status = "queued";
       } else if (action === "merge" && t.status === "done" && t.branch) {
         const r = mergeTaskBranch(t, g);
         if (!r.ok) return r;
@@ -1191,6 +1255,7 @@ const UI_HTML = `<!DOCTYPE html>
   .st-reverted { background: rgba(0,0,0,.05); color: var(--sub); }
   .st-deferred { background: rgba(0,0,0,.05); color: var(--faint); }
   .st-failed, .st-interrupted { background: rgba(255,59,48,.1); color: var(--red); }
+  .st-paused { background: rgba(255,106,0,.1); color: var(--orange); }
   .st-discarded { background: rgba(0,0,0,.03); color: var(--faint); }
   .meta { font-size: 12px; color: var(--sub); margin-top: 4px; }
   .meta code { font-family: ui-monospace, monospace; font-size: 11px; }
@@ -1217,7 +1282,7 @@ const UI_HTML = `<!DOCTYPE html>
 <div class="flash" id="flash"></div>
 <script>
 const TABS = [
-  ["active", "Active", t => ["queued","running","deferred"].includes(t.status)],
+  ["active", "Active", t => ["queued","paused","running","deferred"].includes(t.status)],
   ["review", "To review", t => ["done","failed","interrupted"].includes(t.status)],
   ["completed", "Completed", t => ["merged","reverted"].includes(t.status)],
 ];
@@ -1265,6 +1330,7 @@ function render() {
 function card(t) {
   const b = [];
   if (t.status === "queued") b.push(btn(t, "run", "Run now", "primary"), btn(t, "defer", "Defer"), btn(t, "discard", "Remove", "danger"));
+  if (t.status === "paused") b.push(btn(t, "run", "Resume now", "primary"), btn(t, "defer", "Defer"), btn(t, "restart", "Start over"), btn(t, "discard", "Remove", "danger"));
   if (t.status === "deferred") b.push(btn(t, "requeue", "Requeue", "primary"), btn(t, "discard", "Remove", "danger"));
   if (t.status === "done") {
     b.push(btn(t, "merge", "Merge", "primary"));
@@ -1272,7 +1338,7 @@ function card(t) {
     if (t.report) b.push('<button onclick="toggle(\\'' + t.id + '\\',\\'report\\')">Report</button>');
     b.push(btn(t, "discard", "Discard", "danger"));
   }
-  if (["failed", "interrupted"].includes(t.status)) b.push(btn(t, "requeue", "Retry", "primary"), btn(t, "discard", "Discard", "danger"));
+  if (["failed", "interrupted"].includes(t.status)) b.push(btn(t, "requeue", t.sessionId ? "Resume" : "Retry", "primary"), btn(t, "restart", "Start over"), btn(t, "discard", "Discard", "danger"));
   if (t.status === "merged") {
     b.push(btn(t, "revert", "Revert", "danger"));
     b.push(btn(t, "discard", "Dismiss"));
@@ -1338,7 +1404,7 @@ else {
   console.log(`usage:
   trac status | report [--days N] | json | export [--days N]
   trac add "<spec>" [--repo <path>] [-p N] [--budget N] [--analyze] [--push] [--pr] [--prep]
-  trac tasks | rm <id> | run [id] [--dry] | morning
+  trac tasks | rm <id> | run [id] [--dry] [--fresh] | morning
   trac daemon [uninstall]`);
   process.exit(1);
 }
