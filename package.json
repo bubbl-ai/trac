@@ -1,0 +1,9 @@
+{
+  "name": "trac",
+  "version": "0.1.0",
+  "description": "See how much of your Claude subscription you actually use — and what goes to waste.",
+  "type": "module",
+  "bin": { "trac": "./trac.js" },
+  "engines": { "node": ">=18" },
+  "license": "MIT"
+}
