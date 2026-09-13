@@ -9,6 +9,102 @@ work and dispatch it into idle quota while you are away.
 
 Nothing leaves your machine except the usage call to Anthropic. No dependencies, no build step.
 
+## Getting started, step by step
+
+Each step is one command and what you should see. The sections after this one are the
+reference for every flag.
+
+1. **Install Node 18 or newer** if `node --version` fails. Homebrew works; so does the
+   no-admin tarball under Requirements below.
+
+2. **Get Trac and take a first look.**
+
+   ```sh
+   git clone git@github.com:ArcherX0X/trac.git ~/trac
+   cd ~/trac && npm link
+   trac status
+   ```
+
+   You should see your plan, the current 5-hour window and the week as bars, and the burn
+   rate. macOS may ask once whether Trac can read Claude Code's Keychain entry. Allow it,
+   or the numbers fall back to estimates.
+
+3. **See where your week went.** `trac report` shows the last 14 days and how many windows
+   went unused. `trac report --days 30` for a month.
+
+4. **Put the gauge in the menu bar.**
+
+   ```sh
+   cd ~/trac/menubar && swiftc -O tracbar.swift -o tracbar && ./tracbar &
+   ```
+
+   A colored dot with the session percentage appears within a few seconds. Click it for
+   the week and the reset times. The Menu bar section below covers starting it at login.
+
+5. **Queue a first task, read-only.**
+
+   ```sh
+   trac add "review the error handling in src/ and list what would break under load" --repo ~/proj --analyze
+   trac tasks
+   ```
+
+   `--analyze` means the run writes a report instead of changing code, which is the right
+   first task while you decide how much to trust the runner.
+
+6. **Run it once by hand, while you watch.**
+
+   ```sh
+   trac run t1
+   trac morning
+   ```
+
+   The run happens in a worktree under `~/.trac/work/t1` on a branch named `trac/t1-...`.
+   Your working tree is not touched. `trac morning` shows what it did and the command to
+   review the branch. For an analysis task the report is under `~/.trac/reports/`.
+
+7. **Turn on the scheduler.**
+
+   ```sh
+   trac daemon
+   ```
+
+   From now on, every 15 minutes, Trac runs the next queued task if the live gauge is
+   readable, the session window plus the task's budget is under 75%, the week is under
+   90%, and you have been idle 15 minutes. Queue tasks with `trac add` in the evening and
+   read `trac morning` the next day. `trac daemon uninstall` turns it off.
+
+8. **Hand a session over when you hit the wall.** Inside a Claude Code session that just
+   hit the limit, or one you have to leave:
+
+   ```
+   /trac
+   ```
+
+   or, once Claude can no longer respond, run the shell directly from the prompt box:
+
+   ```
+   ! trac adopt $CLAUDE_CODE_SESSION_ID
+   ```
+
+   Install the `/trac` command once with `cp ~/trac/commands/trac.md ~/.claude/commands/`.
+   Then leave that session. Trac continues a forked copy after the reset, in your working
+   tree, and `trac morning` gives you `claude --resume <id>` to pick the conversation back
+   up with everything it did in context. `trac release t3` takes it back any time.
+
+9. **Let Trac pick sessions up on its own** in the repos where you want that:
+
+   ```sh
+   trac watch ~/proj
+   ```
+
+   Any session started there that is active when the window caps is adopted
+   automatically and continued after the reset. If you carry on in the original session
+   yourself, Trac notices and lets go. `trac unwatch ~/proj` stops it.
+
+10. **Undo anything.** `trac rm t3` deletes a task and its worktree, `trac release t3`
+    hands a session back, `trac unwatch` stops automatic pickup, `trac daemon uninstall`
+    stops the scheduler, and deleting `~/.trac` resets Trac entirely.
+
 ## Requirements
 
 - macOS. The live quota lookup reads your Claude Code token from the Keychain, and the menu
@@ -73,7 +169,7 @@ trac run t3 --dry          # exercise the worktree flow without calling Claude
 trac run t3 --fresh        # start a paused or failed task over, discarding its session and branch
 trac morning               # what finished while you were away, marked as read
 trac ui                    # browser dashboard at http://localhost:7433
-trac sessions              # recent Claude Code sessions in this directory (--all for every project)
+trac sessions              # recent Claude Code sessions in this directory (--all for every project, -n 20 for more)
 trac adopt <session-id>    # hand an interactive session to trac, see below
 trac release t3            # take it back; prints the command to continue it yourself
 trac watch [path]          # pick up any session here that hits the limit, without a handoff
@@ -222,7 +318,9 @@ Remove with `launchctl bootout gui/$(id -u)/com.trac.menubar`.
 ## Where state lives
 
 Everything is under `~/.trac/`, created on first run: the quota cache, the task queue,
-per-task reports, prepared spec folders, and worktrees. Delete the directory to reset.
+per-task reports, prepared spec folders, worktrees, the watched directories
+(`config.json`) and the sessions you took back (`state.json`). Delete the directory to
+reset.
 
 ## Caveats
 
@@ -239,5 +337,5 @@ per-task reports, prepared spec folders, and worktrees. Delete the directory to 
 ## Roadmap
 
 See [ROADMAP.md](ROADMAP.md). Tracking, warnings, the task runner, the prep pass, pausing
-and resuming, and the session handoff are built. Plan right-sizing, the weekly digest, a
-compiled binary and a team tier are not.
+and resuming, the session handoff and automatic pickup are built. Plan right-sizing, the
+weekly digest, a compiled binary and a team tier are not.
