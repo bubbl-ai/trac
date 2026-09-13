@@ -53,8 +53,10 @@ The runner stops being only for specs: the conversation you were in becomes the 
       `! trac adopt $CLAUDE_CODE_SESSION_ID` once the limit has hit
 - [x] **auto-continue** — an adopted session runs under the normal gates, in the
       user's working tree; limit, time slice and turn budget all pause rather than fail
-- [ ] later: auto-adopt (opt-in per repo: a session that hits the limit there is
-      picked up without a handoff)
+- [x] **auto-adopt** — `trac watch [path]`: on a capped daemon tick, sessions started
+      there and active in the last 30 min are adopted (the live gauge is the signal,
+      not the limit message); the let-go rule ends the task if the user carries on in
+      the original, or in trac's copy, so two agents never share a working tree
 
 ## M4 — Distribution
 - [ ] **compiled no-Node binary** (`bun build --compile`) — removes the Node 18+ ask

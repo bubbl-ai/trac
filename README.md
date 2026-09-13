@@ -76,6 +76,8 @@ trac ui                    # browser dashboard at http://localhost:7433
 trac sessions              # recent Claude Code sessions in this directory (--all for every project)
 trac adopt <session-id>    # hand an interactive session to trac, see below
 trac release t3            # take it back; prints the command to continue it yourself
+trac watch [path]          # pick up any session here that hits the limit, without a handoff
+trac unwatch [path]        # stop that; trac watch --list shows what is watched
 ```
 
 Flags for `trac add`:
@@ -173,6 +175,27 @@ What happens next:
 
 `trac release <id>` takes a session back at any time. If it is running, the run is
 stopped first. The dashboard's Release button does the same.
+
+### Picking sessions up automatically
+
+`trac watch` marks the current directory, or a path, as one where a session that runs
+into the window limit should be picked up without a handoff. The daemon does not need
+the limit message for this: on any tick where the live gauge reads capped, every
+session started in a watched directory that was active in the last 30 minutes is
+adopted, with a notification naming the task, and continued after the reset exactly
+as a handed-off session would be. `trac unwatch` stops it and `trac watch --list`
+shows what is watched. Nothing watches until the daemon is installed.
+
+Because nobody said "take this", Trac is careful about one thing: if you carry on in
+the original session yourself, Trac lets go. Before every run it counts your prompts
+in the original transcript, and in its own copy. If the original has a new prompt
+from after the session became usable again, or its copy has one it did not write,
+the task ends as failed with a note saying so, and nothing runs. The same rule
+protects sessions you handed over with `trac adopt`. A prompt typed while the window
+was still capped could not have been answered, so it does not count.
+
+A session you took back with `trac release`, `trac rm` or the dashboard is never picked
+up again on its own. Handing it over explicitly with `trac adopt` clears that.
 
 ## Menu bar gauge
 

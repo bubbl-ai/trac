@@ -609,7 +609,7 @@ function cmdTaskList() {
                   t.status === "done" ? ` → ${t.branch}${t.commits ? ` (${t.commits} commits)` : ""}` :
                   t.status === "failed" ? ` — ${t.error || "failed"}` :
                   t.status === "paused" ? ` — paused, quota exhausted; resumes when the window resets (attempt ${t.attempts || 1})` : "";
-    console.log(`  ${icons[t.status] || "?"} ${C.bold(t.id.padEnd(4))} [${t.kind === "session" ? "session" : t.mode}, p${t.priority}] ${path.basename(t.repo)}: ${titleOf(t).slice(0, 70)}${extra ? C.dim(extra) : ""}`);
+    console.log(`  ${icons[t.status] || "?"} ${C.bold(t.id.padEnd(4))} [${t.kind === "session" ? (t.auto ? "session, auto" : "session") : t.mode}, p${t.priority}] ${path.basename(t.repo)}: ${titleOf(t).slice(0, 70)}${extra ? C.dim(extra) : ""}`);
   }
   console.log();
 }
@@ -633,6 +633,7 @@ function cmdTaskRm(id, { release = false } = {}) {
   if (fs.existsSync(specDir)) { try { fs.rmSync(specDir, { recursive: true, force: true }); } catch {} }
   mutateTasks((fresh) => { fresh.tasks = fresh.tasks.filter((x) => x.id !== id); });
   if (t.kind === "session") {
+    markReleased([t.sessionId, t.sourceSession]);
     console.log(`  released ${id}${stopped ? " (stopped its run)" : ""}`);
     console.log(`  continue it yourself: claude --resume ${t.sessionId || t.sourceSession}`);
     if (t.sessionId) console.log(C.dim(`  that is trac's copy, with its work; your original is ${t.sourceSession.slice(0, 8)}`));
@@ -677,7 +678,7 @@ function readSessionMeta(file) {
       const c = d.message?.content;
       const txt = typeof c === "string" ? c
         : Array.isArray(c) ? c.filter((x) => x && x.type === "text").map((x) => x.text).join(" ") : "";
-      if (!txt || txt.startsWith("<")) continue; // tool results and injected context, not the human
+      if (!txt || txt.startsWith("<") || /\btrac (adopt|release|watch)\b/.test(txt)) continue; // tool results, injected context, the handoff itself
       m.turns++;
       if (!m.cwd && d.cwd) m.cwd = d.cwd;
       if (!m.firstPrompt) m.firstPrompt = txt.replace(/\s+/g, " ").trim().slice(0, 120);
@@ -711,7 +712,38 @@ function cmdSessions(rest) {
   console.log(C.dim(`\n  hand one to trac: trac adopt <id>     (inside a session: trac adopt $CLAUDE_CODE_SESSION_ID)\n`));
 }
 
-function cmdAdopt(rest) {
+// One record for a session trac holds. `freeAt` is when the session is usable
+// again (now, or the window reset if it is capped): prompts the user types after
+// that mean they carried on without trac, prompts before it could not be answered.
+function adoptSession(m, { repo, note = "", priority = 2, budget = 25, auto = false, resetsAt = null } = {}) {
+  const freeAt = new Date(Math.max(Date.now(), resetsAt ? Date.parse(resetsAt) || 0 : 0)).toISOString();
+  return mutateTasks((db) => {
+    const t = {
+      id: "t" + db.nextId++,
+      kind: "session",
+      spec: m.title || m.firstPrompt || m.id.slice(0, 8),
+      repo,
+      sourceSession: m.id,
+      sourceTurns: m.turns,
+      freeAt,
+      priority,
+      budget,
+      mode: "build",
+      push: false,
+      pr: false,
+      status: "queued",
+      createdAt: new Date().toISOString(),
+      reported: true,
+    };
+    if (note) t.note = note;
+    if (auto) t.auto = true;
+    db.tasks.push(t);
+    return t;
+  });
+}
+
+async function cmdAdopt(rest) {
+  // (an explicit handoff always wins over an earlier release: see markReleased below)
   const flags = ["--repo", "--budget", "-p", "--note"];
   const flag = (name, dflt) => { const i = rest.indexOf(name); return i >= 0 ? rest[i + 1] : dflt; };
   const positional = rest.filter((a, i) => !a.startsWith("-") && !flags.includes(rest[i - 1]));
@@ -741,31 +773,119 @@ function cmdAdopt(rest) {
   if (owner) { console.error(`  already with trac as ${owner.id} (${owner.status})`); process.exit(1); }
   const repo = path.resolve(flag("--repo", m.cwd || process.cwd()));
   if (!fs.existsSync(repo)) { console.error(`  no such directory: ${repo}`); process.exit(1); }
-  const title = m.title || m.firstPrompt || m.id.slice(0, 8);
-  const note = flag("--note", "");
-  const task = mutateTasks((db) => {
-    const t = {
-      id: "t" + db.nextId++,
-      kind: "session",
-      spec: title,
-      repo,
-      sourceSession: m.id,
-      priority: parseInt(flag("-p", "2"), 10) || 2,
-      budget: parseInt(flag("--budget", "25"), 10) || 25,
-      mode: "build",
-      push: false,
-      pr: false,
-      status: "queued",
-      createdAt: new Date().toISOString(),
-      reported: true,
-    };
-    if (note) t.note = note;
-    db.tasks.push(t);
-    return t;
+  const quota = await fetchQuota();
+  const capped = quota && quota.five_hour.utilization >= 99 ? quota.five_hour.resets_at : null;
+  markReleased([m.id], false);
+  const task = adoptSession(m, {
+    repo, note: flag("--note", ""), auto: false, resetsAt: capped,
+    priority: parseInt(flag("-p", "2"), 10) || 2, budget: parseInt(flag("--budget", "25"), 10) || 25,
   });
-  console.log(`  ${C.bold(task.id)} now holds session ${C.bold(m.id.slice(0, 8))}: ${title.slice(0, 70)}`);
+  console.log(`  ${C.bold(task.id)} now holds session ${C.bold(m.id.slice(0, 8))}: ${titleOf(task).slice(0, 70)}`);
   console.log(C.dim(`  it continues as a forked copy in ${repo} once the window has room and you have been idle ${IDLE_MIN} min`));
   console.log(C.dim(`  leave that Claude session now; take the work back any time: trac release ${task.id}`));
+}
+
+// ── Auto-adopt: a session that hits the limit in a watched repo ─────────────
+// The daemon never needs the limit message. When the live gauge reads capped,
+// whichever sessions started in a watched directory were active in the last
+// AUTO_ADOPT_LOOKBACK_MIN minutes are the ones that ran into the wall.
+const AUTO_ADOPT_LOOKBACK_MIN = 30;
+
+function watchedRepos() {
+  const cfg = loadState("config.json", {});
+  return Array.isArray(cfg.autoAdopt) ? cfg.autoAdopt : [];
+}
+
+// Sessions the user took back (release, rm, Remove). The capped-tick sweep never
+// picks these up again on its own; an explicit `trac adopt` clears the mark.
+function releasedSessions() {
+  const st = loadState("state.json", {});
+  return Array.isArray(st.releasedSessions) ? st.releasedSessions : [];
+}
+function markReleased(ids, on = true) {
+  const st = loadState("state.json", {});
+  const cur = releasedSessions().filter((x) => !ids.includes(x));
+  st.releasedSessions = (on ? [...cur, ...ids.filter(Boolean)] : cur).slice(-100);
+  saveState("state.json", st);
+}
+
+function notify(msg) {
+  if (process.env.TRAC_NO_NOTIFY === "1") return;
+  try { execSync(`osascript -e 'display notification ${JSON.stringify(msg)} with title "Trac"'`, { stdio: "ignore" }); } catch {}
+}
+
+function inRepo(cwd, repo) { return !!cwd && (cwd === repo || cwd.startsWith(repo + "/")); }
+
+function autoAdoptCapped(quota) {
+  if (!quota || quota.five_hour.utilization < 99) return [];
+  const watched = watchedRepos();
+  if (!watched.length) return [];
+  const owned = new Set([...loadTasks().tasks.flatMap((t) => [t.sessionId, t.sourceSession]), ...releasedSessions()].filter(Boolean));
+  const cutoff = Date.now() - AUTO_ADOPT_LOOKBACK_MIN * 60000;
+  const adopted = [];
+  for (const { file, mtime } of sessionFiles()) {
+    if (mtime < cutoff) break; // newest first
+    const id = path.basename(file, ".jsonl");
+    if (owned.has(id)) continue;
+    const m = readSessionMeta(file);
+    if (!m || !m.turns || !watched.some((r) => inRepo(m.cwd, r))) continue;
+    const t = adoptSession(m, { repo: m.cwd, auto: true, resetsAt: quota.five_hour.resets_at });
+    owned.add(id);
+    adopted.push(t);
+    notify(`Picked up "${titleOf(t).slice(0, 48)}" at the limit; it continues after the reset. Stop: trac release ${t.id}`);
+  }
+  return adopted;
+}
+
+function cmdWatch(rest, on) {
+  const list = watchedRepos();
+  if (rest.includes("--list")) {
+    console.log(list.length ? "\n" + list.map((r) => `  ${r}`).join("\n") + "\n" : "\n  nothing watched; trac watch [path] adds a directory\n");
+    return;
+  }
+  const repo = path.resolve(rest.find((a) => !a.startsWith("-")) || process.cwd());
+  const cfg = loadState("config.json", {});
+  if (on) {
+    if (!fs.existsSync(repo)) { console.error(`  no such directory: ${repo}`); process.exit(1); }
+    if (!list.includes(repo)) { cfg.autoAdopt = [...list, repo]; saveState("config.json", cfg); }
+    console.log(`  watching ${repo}`);
+    console.log(C.dim(`  a session started here that hits the window limit is picked up and continued after the reset; undo: trac unwatch`));
+    if (!fs.existsSync(path.join(os.homedir(), "Library", "LaunchAgents", "com.trac.daemon.plist"))) console.log(C.orange(`  the daemon is not installed, so nothing watches yet: trac daemon`));
+  } else {
+    if (!list.includes(repo)) { console.log(`  ${repo} was not watched`); return; }
+    cfg.autoAdopt = list.filter((r) => r !== repo); saveState("config.json", cfg);
+    console.log(`  no longer watching ${repo}`);
+  }
+}
+
+function transcriptMeta(sessionId) {
+  const hit = sessionFiles().find((x) => path.basename(x.file, ".jsonl") === sessionId);
+  return hit ? readSessionMeta(hit.file) : null;
+}
+
+// Someone continued the conversation without trac: the original after the handoff
+// (a prompt typed once the session was usable again), or trac's copy after a pause.
+// Two agents in one working tree is the one thing this must never do.
+function sessionMovedOn(t) {
+  const src = transcriptMeta(t.sourceSession);
+  const freeAt = Date.parse(t.freeAt || t.createdAt) || 0;
+  if (src && t.sourceTurns != null && src.turns > t.sourceTurns && src.mtime > freeAt)
+    return "the original session was continued after the handoff, so trac let go";
+  if (t.sessionId && t.forkTurns != null) {
+    const f = transcriptMeta(t.sessionId);
+    if (f && f.turns > t.forkTurns) return "trac's copy of the session was continued by someone else, so trac let go";
+  }
+  return null;
+}
+
+function letGo(id, why) {
+  return mutateTasks((fresh) => {
+    const ft = fresh.tasks.find((x) => x.id === id);
+    if (!ft) return null;
+    ft.status = "failed"; ft.error = why; ft.reported = false; ft.endedAt = new Date().toISOString();
+    delete ft.pid;
+    return ft;
+  });
 }
 
 // ── Idle detection ──────────────────────────────────────────────────────────
@@ -840,6 +960,11 @@ async function dispatch(task, { dry = false, manual = false, fresh = false } = {
   const resuming = !fresh && !!t.sessionId && !dry && (isSession || (!!t.worktree && fs.existsSync(t.worktree)));
   const base = isSession ? null : resuming && t.base ? t.base : defaultBase(t.repo);
   const priorStatus = t.status;
+
+  if (isSession && !dry) {
+    const why = sessionMovedOn(t);
+    if (why) return letGo(task.id, why) || { ...t, status: "failed", error: why };
+  }
 
   fs.mkdirSync(WORK_DIR, { recursive: true });
   fs.mkdirSync(REPORT_DIR, { recursive: true });
@@ -970,6 +1095,7 @@ async function dispatch(task, { dry = false, manual = false, fresh = false } = {
   if (!result.ok && result.error) t.error = result.error.slice(0, 200);
   if ((quotaHit || sliceEnded) && !canResume) t.error = `paused ${RESUME_MAX} times and still not done, giving up`;
   if (t.status === "paused") { t.pausedAt = t.endedAt; delete t.error; } else delete t.pausedAt;
+  if (isSession) { const f = transcriptMeta(t.sessionId); t.forkTurns = f ? f.turns : null; }
   t.reported = t.status === "paused"; // a pause is transient, not a morning item
 
   // Nothing the agent wrote is lost while it waits: snapshot uncommitted edits
@@ -1004,6 +1130,7 @@ async function dispatch(task, { dry = false, manual = false, fresh = false } = {
     ft.status = t.status; ft.reported = t.reported;
     ft.branch = t.branch; ft.worktree = t.worktree; ft.base = t.base;
     ft.sessionId = t.sessionId; ft.attempts = t.attempts; delete ft.pid;
+    if (t.forkTurns != null) ft.forkTurns = t.forkTurns;
     if (t.pausedAt) ft.pausedAt = t.pausedAt; else delete ft.pausedAt;
     if (t.error !== undefined) ft.error = t.error; else delete ft.error;
     if (t.report) ft.report = t.report;
@@ -1138,22 +1265,19 @@ async function cmdDaemonTick(events) {
       st.lastMorning = today;
       saveState("state.json", st);
       const done = unreported.filter((t) => t.status === "done").length;
-      try {
-        execSync(`osascript -e 'display notification ${JSON.stringify(`Overnight: ${done} done, ${unreported.length - done} other. Run: trac morning`)} with title "Trac"'`, { stdio: "ignore" });
-      } catch {}
+      notify(`Overnight: ${done} done, ${unreported.length - done} other. Run: trac morning`);
     }
 
     // dispatch gates — every one must pass
     const quota = await fetchQuota();
     if (!quota) return;                                       // no ground truth → don't spend
+    autoAdoptCapped(quota);                                   // capped: pick up what hit the wall in watched repos
     if (quota.seven_day.utilization >= WEEK_MAX_PCT) return;  // save the week
     if (humanActive()) return;                                // never compete with the human
     const task = pickTask(quota.five_hour.utilization);       // fits under reserve?
     if (!task) return;
     const t = await dispatch(task);
-    try {
-      execSync(`osascript -e 'display notification ${JSON.stringify(`${t.id} ${t.status}: ${titleOf(t).slice(0, 60)}`)} with title "Trac"'`, { stdio: "ignore" });
-    } catch {}
+    notify(`${t.id} ${t.status}: ${titleOf(t).slice(0, 60)}`);
   } finally {
     try { fs.unlinkSync(lock); } catch {}
   }
@@ -1317,6 +1441,7 @@ function uiAction(id, action) {
         return { ok: true };
       } else if (action === "discard") {
         stopTask(t);
+        if (t.kind === "session") markReleased([t.sessionId, t.sourceSession]);
         if (t.worktree) { try { g(`git -C ${JSON.stringify(t.repo)} worktree remove --force ${JSON.stringify(t.worktree)}`); } catch {} }
         if (t.branch) { try { g(`git -C ${JSON.stringify(t.repo)} branch -D ${t.branch}`); } catch {} }
         db.tasks = db.tasks.filter((x) => x.id !== id);
@@ -1595,8 +1720,10 @@ else if (cmd === "add") await cmdTaskAdd(rest);
 else if (cmd === "tasks") cmdTaskList();
 else if (cmd === "rm") cmdTaskRm(rest[0]);
 else if (cmd === "release") cmdTaskRm(rest[0], { release: true });
-else if (cmd === "adopt") cmdAdopt(rest);
+else if (cmd === "adopt") await cmdAdopt(rest);
 else if (cmd === "sessions") cmdSessions(rest);
+else if (cmd === "watch") cmdWatch(rest, true);
+else if (cmd === "unwatch") cmdWatch(rest, false);
 else if (cmd === "run") await cmdRun(rest);
 else if (cmd === "daemon-tick") await cmdDaemonTick(events);
 else if (cmd === "daemon") cmdDaemon(rest);
@@ -1608,6 +1735,7 @@ else {
   trac add "<spec>" [--repo <path>] [-p N] [--budget N] [--analyze] [--push] [--pr] [--prep]
   trac tasks | rm <id> | run [id] [--dry] [--fresh] | morning
   trac sessions [--all] [-n N] | adopt [session-id] [--repo <path>] [--budget N] [-p N] [--note "..."] | release <id>
+  trac watch [path] | unwatch [path] | watch --list
   trac daemon [uninstall]`);
   process.exit(1);
 }
