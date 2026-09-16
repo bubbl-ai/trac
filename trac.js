@@ -899,7 +899,7 @@ function hidIdleSeconds() {
 
 // Project dirs whose Claude activity should NOT count as the human "working" —
 // e.g. the session you use to talk to Trac itself. Matched exactly on dir name
-// so "-Users-tonyx" ignores your main chat but still counts "-Users-tonyx-trac".
+// so "-Users-you" ignores your main chat but still counts "-Users-you-trac".
 function ignoredProjects() {
   const cfg = loadState("config.json", {});
   return Array.isArray(cfg.ignoreProjects) ? cfg.ignoreProjects : [];

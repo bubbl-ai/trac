@@ -67,7 +67,3 @@ The runner stops being only for specs: the conversation you were in becomes the 
 - [ ] per-seat utilization dashboard, shared backlog routed to surplus windows,
       org-level waste number
 - [ ] opt-in anonymous cap benchmarking (the public "actual Claude limits" dataset)
-
-## Pricing sketch
-Free: gauge + status/report. Paid (~$5–10/mo): warnings, right-sizing, digest,
-coaching. Pro (~$15–20/mo): scheduler + execution. Team: per-seat.

@@ -8,6 +8,7 @@ window, the week, and how much of your plan went unused. A built-in task runner 
 work and dispatch it into idle quota while you are away.
 
 Nothing leaves your machine except the usage call to Anthropic. No dependencies, no build step.
+MIT, from the team behind [Bubbl](https://bubblai.com).
 
 ## Getting started, step by step
 
@@ -20,7 +21,7 @@ reference for every flag.
 2. **Get Trac and take a first look.**
 
    ```sh
-   git clone git@github.com:ArcherX0X/trac.git ~/trac
+   git clone https://github.com/bubbl-ai/trac.git ~/trac
    cd ~/trac && npm link
    trac status
    ```
@@ -123,7 +124,7 @@ reference for every flag.
 ## Install
 
 ```sh
-git clone git@github.com:ArcherX0X/trac.git ~/trac
+git clone https://github.com/bubbl-ai/trac.git ~/trac
 cd ~/trac && npm link        # puts `trac` on your PATH
 trac status
 ```
