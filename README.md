@@ -334,9 +334,3 @@ reset.
   unrelated first.
 - Transcripts are parsed on every command, which takes under a second for a few weeks of
   history.
-
-## Roadmap
-
-See [ROADMAP.md](ROADMAP.md). Tracking, warnings, the task runner, the prep pass, pausing
-and resuming, the session handoff and automatic pickup are built. Plan right-sizing, the
-weekly digest, a compiled binary and a team tier are not.
