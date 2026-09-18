@@ -36,11 +36,13 @@ reference for every flag.
 4. **Put the gauge in the menu bar.**
 
    ```sh
-   cd ~/trac/menubar && swiftc -O tracbar.swift -o tracbar && ./tracbar &
+   trac menubar
    ```
 
-   A colored dot with the session percentage appears within a few seconds. Click it for
-   the week and the reset times. The Menu bar section below covers starting it at login.
+   This compiles the gauge on first run, which needs the Xcode Command Line Tools
+   (`xcode-select --install`), and registers it to start at login. A colored dot with the
+   session percentage appears within a few seconds. Click it for the week and the reset
+   times.
 
 5. **Queue a first task, read-only.**
 
@@ -104,7 +106,8 @@ reference for every flag.
 
 10. **Undo anything.** `trac rm t3` deletes a task and its worktree, `trac release t3`
     hands a session back, `trac unwatch` stops automatic pickup, `trac daemon uninstall`
-    stops the scheduler, and deleting `~/.trac` resets Trac entirely.
+    stops the scheduler, `trac menubar uninstall` removes the gauge, and deleting
+    `~/.trac` resets Trac entirely.
 
 ## Requirements
 
@@ -299,22 +302,25 @@ up again on its own. Handing it over explicitly with `trac adopt` clears that.
 An always-visible session percentage, refreshed every 60 seconds.
 
 ```sh
-cd menubar && swiftc -O tracbar.swift -o tracbar && ./tracbar &
+trac menubar               # compile if needed, start now, and start at every login
+trac menubar uninstall
 ```
 
 🟢 under 50% · 🟠 50 to 80% · 🔴 80% and up. Click it for the week, reset times, burn rate
-and task counts. Quit from its menu. The binary finds `trac.js` one directory above itself,
-so the checkout can live anywhere.
+and task counts.
 
-To start it at login, edit the path in `menubar/com.trac.menubar.plist` to your compiled
-binary, then:
+`trac menubar` compiles `menubar/tracbar.swift` with `swiftc` when the binary is missing or
+older than its source (the Xcode Command Line Tools provide `swiftc`), then writes a launchd
+agent at `~/Library/LaunchAgents/com.trac.menubar.plist` pointing at the compiled binary and
+loads it. The binary finds `trac.js` one directory above itself, so the checkout can live
+anywhere. Quitting from the gauge's own menu stops it until the next login; `trac menubar
+uninstall` removes the agent.
+
+To run it once without registering it, compile it yourself and launch the binary:
 
 ```sh
-cp menubar/com.trac.menubar.plist ~/Library/LaunchAgents/
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.trac.menubar.plist
+cd menubar && swiftc -O tracbar.swift -o tracbar && ./tracbar &
 ```
-
-Remove with `launchctl bootout gui/$(id -u)/com.trac.menubar`.
 
 ## Where state lives
 

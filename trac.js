@@ -1305,8 +1305,67 @@ function cmdDaemon(rest) {
   <key>ProcessType</key><string>Background</string>
 </dict></plist>`;
   fs.writeFileSync(plistPath, plist);
-  try { execSync(`launchctl bootout gui/$(id -u)/com.trac.daemon 2>/dev/null; launchctl bootstrap gui/$(id -u) ${JSON.stringify(plistPath)}`, { stdio: "ignore", shell: "/bin/zsh" }); } catch {}
+  loadAgent("com.trac.daemon", plistPath);
   console.log(`  daemon installed — checks every 15 min (reserve ${RESERVE_PCT}%, idle ${IDLE_MIN}min, week cap ${WEEK_MAX_PCT}%)`);
+}
+
+function cmdMenubar(rest) {
+  const plistPath = path.join(os.homedir(), "Library", "LaunchAgents", "com.trac.menubar.plist");
+  if (rest.includes("uninstall")) {
+    try { execSync(`launchctl bootout gui/$(id -u)/com.trac.menubar`, { stdio: "ignore", shell: "/bin/zsh" }); } catch {}
+    try { fs.unlinkSync(plistPath); } catch {}
+    console.log("  menu bar gauge uninstalled");
+    return;
+  }
+  // The binary must sit in menubar/ next to its source: it finds trac.js one directory up.
+  const dir = path.join(path.dirname(fileURLToPathSafe()), "menubar");
+  const src = path.join(dir, "tracbar.swift");
+  const bin = path.join(dir, "tracbar");
+  const stale = !fs.existsSync(bin) || fs.statSync(bin).mtimeMs < fs.statSync(src).mtimeMs;
+  if (stale) {
+    console.log("  compiling tracbar...");
+    try {
+      execSync("swiftc -O tracbar.swift -o tracbar", { cwd: dir, stdio: "inherit", shell: "/bin/zsh" });
+    } catch {
+      console.log(C.red("  swiftc failed. It comes with the Xcode Command Line Tools: xcode-select --install"));
+      process.exit(1);
+    }
+  }
+  const plist = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.trac.menubar</string>
+  <key>ProgramArguments</key><array>
+    <string>${bin}</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict>
+    <key>SuccessfulExit</key><false/>
+  </dict>
+  <key>ProcessType</key><string>Interactive</string>
+</dict></plist>`;
+  fs.writeFileSync(plistPath, plist);
+  if (!loadAgent("com.trac.menubar", plistPath)) {
+    console.log(C.red(`  launchd refused to load it. Try: launchctl bootstrap gui/$(id -u) ${plistPath}`));
+    process.exit(1);
+  }
+  console.log("  menu bar gauge installed — running now and at every login (trac menubar uninstall removes it)");
+}
+
+// Unload then load a launchd agent. launchd tears an agent down asynchronously, so a
+// bootstrap issued right after bootout is refused while the old one is still going;
+// retry for a couple of seconds before giving up.
+function loadAgent(label, plistPath) {
+  try { execSync(`launchctl bootout gui/$(id -u)/${label}`, { stdio: "ignore", shell: "/bin/zsh" }); } catch {}
+  for (let i = 0; i < 20; i++) {
+    try {
+      execSync(`launchctl bootstrap gui/$(id -u) ${JSON.stringify(plistPath)}`, { stdio: "ignore", shell: "/bin/zsh" });
+      return true;
+    } catch {
+      sleepSync(150);
+    }
+  }
+  return false;
 }
 
 function fileURLToPathSafe() {
@@ -1727,6 +1786,7 @@ else if (cmd === "unwatch") cmdWatch(rest, false);
 else if (cmd === "run") await cmdRun(rest);
 else if (cmd === "daemon-tick") await cmdDaemonTick(events);
 else if (cmd === "daemon") cmdDaemon(rest);
+else if (cmd === "menubar") cmdMenubar(rest);
 else if (cmd === "morning") cmdMorning();
 else if (cmd === "ui") await cmdUi(rest);
 else {
@@ -1736,6 +1796,6 @@ else {
   trac tasks | rm <id> | run [id] [--dry] [--fresh] | morning
   trac sessions [--all] [-n N] | adopt [session-id] [--repo <path>] [--budget N] [-p N] [--note "..."] | release <id>
   trac watch [path] | unwatch [path] | watch --list
-  trac daemon [uninstall]`);
+  trac daemon [uninstall] | menubar [uninstall]`);
   process.exit(1);
 }
