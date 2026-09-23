@@ -294,8 +294,12 @@ the task ends as failed with a note saying so, and nothing runs. The same rule
 protects sessions you handed over with `trac adopt`. A prompt typed while the window
 was still capped could not have been answered, so it does not count.
 
-A session you took back with `trac release`, `trac rm` or the dashboard is never picked
-up again on its own. Handing it over explicitly with `trac adopt` clears that.
+A session you took back while Trac still held it, with `trac release`, `trac rm` or the
+dashboard, is never picked up again on its own. Handing it over explicitly with `trac adopt`
+clears that. A task Trac has ended (done, failed or interrupted) holds on less: it never
+blocks `trac adopt`, and once you carry on in its original or in Trac's copy, that
+conversation is picked up at its next limit like any other. Clearing such a task
+(Dismiss, or `trac rm`) takes back only Trac's own copy.
 
 ## Menu bar gauge
 
