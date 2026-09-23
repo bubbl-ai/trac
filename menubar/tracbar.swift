@@ -79,7 +79,10 @@ final class TracBar: NSObject, NSApplicationDelegate {
         if sPct >= 100, let reset = Self.parseISO(session["resetsAt"] as? String) {
           // sleep until 30s past the reset, then resume polling
           self.pauseUntil = reset.addingTimeInterval(30)
-          title = "🔴 100%\(sReset.map { " → \($0)" } ?? "")"
+          // Same width as any other reading; the reset time is in the menu. Next to
+          // a notch there is little room, and a wider item pushes its neighbours out
+          // of sight until the reset (the Codex gauge beside it, in practice).
+          title = "🔴 100%"
         } else {
           self.pauseUntil = nil
           title = "\(Self.dot(sPct)) \(sPct)%"

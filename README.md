@@ -307,7 +307,9 @@ trac menubar uninstall
 ```
 
 🟢 under 50% · 🟠 50 to 80% · 🔴 80% and up. Click it for the week, reset times, burn rate
-and task counts.
+and task counts. At the limit it reads 🔴 100% and stops polling until the reset; the reset
+time is in its menu, not the title, so hitting the limit does not widen the item and push
+other menu bar icons out of sight (on a notched Mac there is little room).
 
 `trac menubar` compiles `menubar/tracbar.swift` with `swiftc` when the binary is missing or
 older than its source (the Xcode Command Line Tools provide `swiftc`), then writes a launchd
