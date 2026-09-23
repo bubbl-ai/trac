@@ -294,12 +294,18 @@ the task ends as failed with a note saying so, and nothing runs. The same rule
 protects sessions you handed over with `trac adopt`. A prompt typed while the window
 was still capped could not have been answered, so it does not count.
 
-A session you took back while Trac still held it, with `trac release`, `trac rm` or the
-dashboard, is never picked up again on its own. Handing it over explicitly with `trac adopt`
-clears that. A task Trac has ended (done, failed or interrupted) holds on less: it never
-blocks `trac adopt`, and once you carry on in its original or in Trac's copy, that
-conversation is picked up at its next limit like any other. Clearing such a task
-(Dismiss, or `trac rm`) takes back only Trac's own copy.
+A session you took back while Trac still held it (queued, running, paused or deferred),
+with `trac release`, `trac rm` or the dashboard, is never picked up again on its own.
+Handing it over explicitly with `trac adopt <id>` clears that.
+
+A task Trac has ended (done, failed or interrupted) holds on less. Its original and
+Trac's copy stay with it only until you type in that conversation again; from then on
+it is picked up at its next limit like any other. A window that is merely open, or
+reloaded, does not count, only a new prompt. Clearing the task (Dismiss, `trac rm` or
+`trac release`) keeps that rule and takes nothing back. An ended task never blocks
+`trac adopt <id>`; if you then resume the old task from the dashboard, it steps aside
+for the newer one instead of running the same work twice. A bare `trac adopt` with no
+id never picks a conversation that is still Trac's.
 
 ## Menu bar gauge
 
@@ -311,9 +317,10 @@ trac menubar uninstall
 ```
 
 🟢 under 50% · 🟠 50 to 80% · 🔴 80% and up. Click it for the week, reset times, burn rate
-and task counts. At the limit it reads 🔴 100% and stops polling until the reset; the reset
-time is in its menu, not the title, so hitting the limit does not widen the item and push
-other menu bar icons out of sight (on a notched Mac there is little room).
+and task counts. At the limit it reads just 🔴 100% and stops polling until the first poll
+after the reset; the reset time and the task counts are in its menu, not the title, so
+hitting the limit does not widen the item and push other menu bar icons out of sight (on a
+notched Mac there is little room).
 
 `trac menubar` compiles `menubar/tracbar.swift` with `swiftc` when the binary is missing or
 older than its source (the Xcode Command Line Tools provide `swiftc`), then writes a launchd
@@ -332,8 +339,8 @@ cd menubar && swiftc -O tracbar.swift -o tracbar && ./tracbar &
 
 Everything is under `~/.trac/`, created on first run: the quota cache, the task queue,
 per-task reports, prepared spec folders, worktrees, the watched directories
-(`config.json`) and the sessions you took back (`state.json`). Delete the directory to
-reset.
+(`config.json`), and in `state.json` the sessions you took back and those of cleared,
+finished tasks. Delete the directory to reset.
 
 ## Caveats
 

@@ -79,9 +79,11 @@ final class TracBar: NSObject, NSApplicationDelegate {
         if sPct >= 100, let reset = Self.parseISO(session["resetsAt"] as? String) {
           // sleep until 30s past the reset, then resume polling
           self.pauseUntil = reset.addingTimeInterval(30)
-          // Same width as any other reading; the reset time is in the menu. Next to
-          // a notch there is little room, and a wider item pushes its neighbours out
-          // of sight until the reset (the Codex gauge beside it, in practice).
+          // At most a digit wider than the reading before it: the reset time and task counts
+          // are in the menu. Next to a notch there is little room, and a wider item
+          // pushes its neighbours out of sight until the reset (the Codex gauge
+          // beside it, in practice). Auto-adopt queues a task right at the limit, so
+          // a badge would widen it too.
           title = "🔴 100%"
         } else {
           self.pauseUntil = nil
@@ -95,7 +97,7 @@ final class TracBar: NSObject, NSApplicationDelegate {
         if let q = tasks["queued"], q > 0 { badges.append("\(q)⏳") }
         if let r = tasks["running"], r > 0 { badges.append("\(r)⚙") }
         if let d = tasks["done"], d > 0 { badges.append("\(d)✓") }
-        if !badges.isEmpty { title += " · " + badges.joined(separator: " ") }
+        if !badges.isEmpty && self.pauseUntil == nil { title += " · " + badges.joined(separator: " ") }
         self.item.button?.title = title
 
         let menu = NSMenu()

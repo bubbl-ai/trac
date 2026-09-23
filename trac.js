@@ -633,8 +633,8 @@ function cmdTaskRm(id, { release = false } = {}) {
   if (fs.existsSync(specDir)) { try { fs.rmSync(specDir, { recursive: true, force: true }); } catch {} }
   mutateTasks((fresh) => { fresh.tasks = fresh.tasks.filter((x) => x.id !== id); });
   if (t.kind === "session") {
-    markReleased(takenBack(t));
-    console.log(`  ${ENDED.includes(t.status) ? "removed" : "released"} ${id}${stopped ? " (stopped its run)" : ""}`);
+    removeSessionTask(t);
+    console.log(`  ${release || !ENDED.includes(t.status) ? "released" : "removed"} ${id}${stopped ? " (stopped its run)" : ""}`);
     console.log(`  continue it yourself: claude --resume ${t.sessionId || t.sourceSession}`);
     if (t.sessionId) console.log(C.dim(`  that is trac's copy, with its work; your original is ${t.sourceSession.slice(0, 8)}`));
   } else console.log(`  ${release ? "released" : "removed"} ${id}${stopped ? " (stopped its run)" : ""}`);
@@ -667,7 +667,7 @@ function sessionFiles({ cwd = null } = {}) {
 }
 
 function readSessionMeta(file) {
-  const m = { id: path.basename(file, ".jsonl"), file, cwd: null, title: null, firstPrompt: null, turns: 0, mtime: 0 };
+  const m = { id: path.basename(file, ".jsonl"), file, cwd: null, title: null, firstPrompt: null, turns: 0, lastTurnAt: 0, mtime: 0 };
   let text;
   try { m.mtime = fs.statSync(file).mtimeMs; text = fs.readFileSync(file, "utf8"); } catch { return null; }
   for (const line of text.split("\n")) {
@@ -680,6 +680,7 @@ function readSessionMeta(file) {
         : Array.isArray(c) ? c.filter((x) => x && x.type === "text").map((x) => x.text).join(" ") : "";
       if (!txt || txt.startsWith("<") || /\btrac (adopt|release|watch)\b/.test(txt)) continue; // tool results, injected context, the handoff itself
       m.turns++;
+      m.lastTurnAt = Date.parse(d.timestamp) || m.lastTurnAt;
       if (!m.cwd && d.cwd) m.cwd = d.cwd;
       if (!m.firstPrompt) m.firstPrompt = txt.replace(/\s+/g, " ").trim().slice(0, 120);
     }
@@ -687,18 +688,20 @@ function readSessionMeta(file) {
   return m;
 }
 
-// A task holds its sessions (the original and trac's copy) while trac may still
-// run it. Once it has ended it holds each only until that transcript is written
-// again: someone carried on there, so the conversation is theirs, and trac may take
-// it up anew, by hand or at the next limit. `mtime` is the transcript's.
+// A task holds its sessions (the original and trac's copy) while it is queued,
+// running, paused or deferred. Once it has ended it holds each only until someone
+// types in that conversation again: then it is theirs, and trac may take it up anew,
+// by hand or at the next limit. `lastAt` is the transcript's last prompt
+// (readSessionMeta's lastTurnAt), never its mtime: an open Claude Code window keeps
+// appending bookkeeping lines to a transcript nobody is typing in.
 const ENDED = ["done", "failed", "interrupted"];
-function holdsSession(t, id, mtime) {
+function holdsSession(t, id, lastAt) {
   if (t.kind !== "session" || !id || (t.sourceSession !== id && t.sessionId !== id)) return false;
-  return !ENDED.includes(t.status) || !(mtime > Date.parse(t.endedAt));
+  return !ENDED.includes(t.status) || !(lastAt > Date.parse(t.endedAt));
 }
 
-function sessionOwner(sessionId, mtime) {
-  const holders = loadTasks().tasks.filter((t) => holdsSession(t, sessionId, mtime));
+function sessionOwner(sessionId, lastAt) {
+  const holders = loadTasks().tasks.filter((t) => holdsSession(t, sessionId, lastAt));
   return holders.find((t) => !ENDED.includes(t.status)) || holders[0];
 }
 
@@ -716,7 +719,7 @@ function cmdSessions(rest) {
   console.log();
   for (const { file } of files) {
     const m = readSessionMeta(file); if (!m) continue;
-    const o = sessionOwner(m.id, m.mtime);
+    const o = sessionOwner(m.id, m.lastTurnAt);
     const label = (m.title || m.firstPrompt || "(untitled)").slice(0, 54).padEnd(54);
     console.log(`  ${C.bold(m.id.slice(0, 8))}  ${label}  ${C.dim(`${sessionAge(m.mtime)} · ${m.turns} turns${o ? ` · trac ${o.id} (${o.status})` : ""}`)}`);
   }
@@ -726,9 +729,13 @@ function cmdSessions(rest) {
 // One record for a session trac holds. `freeAt` is when the session is usable
 // again (now, or the window reset if it is capped): prompts the user types after
 // that mean they carried on without trac, prompts before it could not be answered.
+// Re-checked under the lock, so a `trac adopt` racing a capped daemon tick yields
+// one task: { task, created: false } when another live task got there first.
 function adoptSession(m, { repo, note = "", priority = 2, budget = 25, auto = false, resetsAt = null } = {}) {
   const freeAt = new Date(Math.max(Date.now(), resetsAt ? Date.parse(resetsAt) || 0 : 0)).toISOString();
   return mutateTasks((db) => {
+    const held = db.tasks.find((x) => x.kind === "session" && !ENDED.includes(x.status) && (x.sourceSession === m.id || x.sessionId === m.id));
+    if (held) return { task: held, created: false };
     const t = {
       id: "t" + db.nextId++,
       kind: "session",
@@ -749,7 +756,7 @@ function adoptSession(m, { repo, note = "", priority = 2, budget = 25, auto = fa
     if (note) t.note = note;
     if (auto) t.auto = true;
     db.tasks.push(t);
-    return t;
+    return { task: t, created: true };
   });
 }
 
@@ -768,7 +775,15 @@ async function cmdAdopt(rest) {
   } else {
     // No id and not inside a session: the newest transcript for this directory,
     // unless several were active in the last 15 minutes (parallel sessions), then ask.
-    const files = sessionFiles({ cwd: process.cwd() });
+    // Never a conversation that is still trac's: its own copies run in this
+    // directory too, and a finished handoff nobody has typed in since is done.
+    const tasks = loadTasks().tasks, retired = retiredSessions();
+    const files = sessionFiles({ cwd: process.cwd() }).filter(({ file }) => {
+      const id = path.basename(file, ".jsonl");
+      if (!(id in retired) && !tasks.some((t) => t.kind === "session" && (t.sessionId === id || t.sourceSession === id))) return true;
+      const meta = readSessionMeta(file);
+      return !!meta && !tracHolds(tasks, retired, id, meta.lastTurnAt);
+    });
     if (!files.length) { console.error(`  no Claude sessions for ${process.cwd()}; see trac sessions --all`); process.exit(1); }
     const recent = files.filter((x) => Date.now() - x.mtime < 15 * 60000);
     if (recent.length > 1) {
@@ -780,18 +795,20 @@ async function cmdAdopt(rest) {
   }
   const m = readSessionMeta(file);
   if (!m) { console.error("  could not read that session's transcript"); process.exit(1); }
-  // A task trac has finished never blocks an explicit handoff; one it may still run does.
-  const owner = sessionOwner(m.id, m.mtime);
-  if (owner && !ENDED.includes(owner.status)) { console.error(`  already with trac as ${owner.id} (${owner.status})`); process.exit(1); }
+  // A task that has ended never blocks a handoff that names the session; a live one
+  // always does, and so does any holder when trac only guessed which session.
+  const owner = sessionOwner(m.id, m.lastTurnAt);
+  if (owner && (!want || !ENDED.includes(owner.status))) { console.error(`  already with trac as ${owner.id} (${owner.status})`); process.exit(1); }
   const repo = path.resolve(flag("--repo", m.cwd || process.cwd()));
   if (!fs.existsSync(repo)) { console.error(`  no such directory: ${repo}`); process.exit(1); }
   const quota = await fetchQuota();
   const capped = quota && quota.five_hour.utilization >= 99 ? quota.five_hour.resets_at : null;
   markReleased([m.id], false);
-  const task = adoptSession(m, {
+  const { task, created } = adoptSession(m, {
     repo, note: flag("--note", ""), auto: false, resetsAt: capped,
     priority: parseInt(flag("-p", "2"), 10) || 2, budget: parseInt(flag("--budget", "25"), 10) || 25,
   });
+  if (!created) { console.error(`  already with trac as ${task.id} (${task.status})`); process.exit(1); }
   console.log(`  ${C.bold(task.id)} now holds session ${C.bold(m.id.slice(0, 8))}: ${titleOf(task).slice(0, 70)}`);
   console.log(C.dim(`  it continues as a forked copy in ${repo} once the window has room and you have been idle ${IDLE_MIN} min`));
   console.log(C.dim(`  leave that Claude session now; take the work back any time: trac release ${task.id}`));
@@ -808,10 +825,9 @@ function watchedRepos() {
   return Array.isArray(cfg.autoAdopt) ? cfg.autoAdopt : [];
 }
 
-// Sessions the user took back (release, rm, Remove). The capped-tick sweep never
-// picks these up again on its own; an explicit `trac adopt` clears the mark.
-// Removing a task trac has finished takes back only trac's own copy: the person's
-// original stays theirs, and a later limit there is picked up like any other.
+// Sessions the user took back (release, rm, Remove) while trac still held them.
+// The capped-tick sweep never picks these up again on its own; an explicit
+// `trac adopt` clears the mark.
 function releasedSessions() {
   const st = loadState("state.json", {});
   return Array.isArray(st.releasedSessions) ? st.releasedSessions : [];
@@ -822,8 +838,35 @@ function markReleased(ids, on = true) {
   st.releasedSessions = (on ? [...cur, ...ids.filter(Boolean)] : cur).slice(-100);
   saveState("state.json", st);
 }
-function takenBack(t) {
-  return ENDED.includes(t.status) ? [t.sessionId] : [t.sessionId, t.sourceSession];
+
+// Sessions of work trac finished whose task is gone (cleared, or started over on a
+// fresh copy), with when that work ended. They keep the rule holdsSession applies
+// while the task is listed: trac's until someone types in them after that time.
+function retiredSessions() {
+  const r = loadState("state.json", {}).retiredSessions;
+  return r && typeof r === "object" && !Array.isArray(r) ? r : {};
+}
+function retireSessions(ids, at) {
+  ids = ids.filter(Boolean);
+  if (!ids.length) return;
+  const st = loadState("state.json", {});
+  const cur = Object.entries(retiredSessions()).filter(([k]) => !ids.includes(k));
+  st.retiredSessions = Object.fromEntries([...cur, ...ids.map((id) => [id, at || new Date().toISOString()])].slice(-100));
+  saveState("state.json", st);
+}
+
+// Is this conversation still trac's? A task holds it, or it was retired and nobody
+// has typed in it since. `lastAt` is its last prompt (readSessionMeta's lastTurnAt).
+function tracHolds(tasks, retired, id, lastAt) {
+  return tasks.some((t) => holdsSession(t, id, lastAt)) || (id in retired && !(lastAt > Date.parse(retired[id])));
+}
+
+// Removing a session task. Taking back one trac may still run releases both of
+// its sessions for good. Clearing one that has ended takes nothing back; its
+// sessions are retired, so the next limit picks them up once someone types there.
+function removeSessionTask(t) {
+  if (ENDED.includes(t.status)) retireSessions([t.sessionId, t.sourceSession], t.endedAt);
+  else markReleased([t.sessionId, t.sourceSession]);
 }
 
 function notify(msg) {
@@ -837,18 +880,20 @@ function autoAdoptCapped(quota) {
   if (!quota || quota.five_hour.utilization < 99) return [];
   const watched = watchedRepos();
   if (!watched.length) return [];
-  const tasks = loadTasks().tasks;
+  const tasks = loadTasks().tasks, retired = retiredSessions();
   const owned = new Set(releasedSessions());
   const cutoff = Date.now() - AUTO_ADOPT_LOOKBACK_MIN * 60000;
   const adopted = [];
   for (const { file, mtime } of sessionFiles()) {
     if (mtime < cutoff) break; // newest first
     const id = path.basename(file, ".jsonl");
-    if (owned.has(id) || tasks.some((t) => holdsSession(t, id, mtime))) continue;
+    if (owned.has(id)) continue;
     const m = readSessionMeta(file);
     if (!m || !m.turns || !watched.some((r) => inRepo(m.cwd, r))) continue;
-    const t = adoptSession(m, { repo: m.cwd, auto: true, resetsAt: quota.five_hour.resets_at });
+    if (tracHolds(tasks, retired, id, m.lastTurnAt)) continue;
+    const { task: t, created } = adoptSession(m, { repo: m.cwd, auto: true, resetsAt: quota.five_hour.resets_at });
     owned.add(id);
+    if (!created) continue;
     adopted.push(t);
     notify(`Picked up "${titleOf(t).slice(0, 48)}" at the limit; it continues after the reset. Stop: trac release ${t.id}`);
   }
@@ -927,7 +972,8 @@ function recentHumanTranscripts(withinMin) {
   const cutoff = Date.now() - withinMin * 60000;
   const ignore = ignoredProjects();
   // Adopted sessions are continued in the user's own project dir; their forks are trac's, not the human's,
-  // until someone resumes one after its task ended (holdsSession).
+  // until the copy is written after its task ended. Judged by any write here, not by prompts as in
+  // holdsSession: a bookkeeping line counted as the human only delays a run.
   const tasks = loadTasks().tasks;
   for (const dir of safeReaddir(CLAUDE_DIR)) {
     if (dir.includes("-trac-work-")) continue; // our own headless runs
@@ -982,7 +1028,11 @@ async function dispatch(task, { dry = false, manual = false, fresh = false } = {
   const priorStatus = t.status;
 
   if (isSession && !dry) {
-    const why = sessionMovedOn(t);
+    // An ended task revived (Resume, Start over, trac run) after its conversation was
+    // handed to trac again: the newer task carries it, and one runs, not both.
+    const newer = db.tasks.find((x) => x.id !== t.id && x.kind === "session" && Date.parse(x.createdAt) > Date.parse(t.createdAt) &&
+      (x.sourceSession === t.sourceSession || (!!t.sessionId && x.sourceSession === t.sessionId)));
+    const why = newer ? `handed to trac again as ${newer.id}, so this one let go` : sessionMovedOn(t);
     if (why) return letGo(task.id, why) || { ...t, status: "failed", error: why };
   }
 
@@ -990,6 +1040,8 @@ async function dispatch(task, { dry = false, manual = false, fresh = false } = {
   fs.mkdirSync(REPORT_DIR, { recursive: true });
   if (isSession && !resuming) {
     // The fork gets a fresh id; the source transcript stays exactly as the user left it.
+    // A copy from an earlier attempt (trac run --fresh) stays trac's until someone types in it.
+    if (t.sessionId) retireSessions([t.sessionId], t.endedAt);
     t.sessionId = crypto.randomUUID();
     t.attempts = 0;
     delete t.windowPctUsed;
@@ -1489,6 +1541,7 @@ function uiAction(id, action) {
       } else if (action === "restart" && ["deferred", "paused", "failed", "interrupted", "discarded"].includes(t.status)) {
         // Start over: drop the conversation and the branch's partial work.
         if (t.worktree) { try { g(`git -C ${JSON.stringify(t.repo)} worktree remove --force ${JSON.stringify(t.worktree)}`); } catch {} delete t.worktree; }
+        if (t.kind === "session") retireSessions([t.sessionId], t.endedAt); // the dropped copy stays trac's
         delete t.sessionId; delete t.attempts; delete t.error; delete t.pausedAt;
         t.status = "queued";
       } else if (action === "merge" && t.status === "done" && t.branch) {
@@ -1520,7 +1573,7 @@ function uiAction(id, action) {
         return { ok: true };
       } else if (action === "discard") {
         stopTask(t);
-        if (t.kind === "session") markReleased(takenBack(t));
+        if (t.kind === "session") removeSessionTask(t);
         if (t.worktree) { try { g(`git -C ${JSON.stringify(t.repo)} worktree remove --force ${JSON.stringify(t.worktree)}`); } catch {} }
         if (t.branch) { try { g(`git -C ${JSON.stringify(t.repo)} branch -D ${t.branch}`); } catch {} }
         db.tasks = db.tasks.filter((x) => x.id !== id);
