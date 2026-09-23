@@ -103,6 +103,47 @@ async function fetchQuota() {
   }
 }
 
+// ── Per-model limits ────────────────────────────────────────────────────────
+// Besides the 5-hour session and the week, a plan can cap one model on its own
+// (a weekly limit on Fable, say). The endpoint lists those in limits[] with a
+// scope.model, and nowhere else. At 99% a model is capped: nothing runs on it
+// until its reset, while the others still can.
+function modelLimits(quota) {
+  return (Array.isArray(quota?.limits) ? quota.limits : [])
+    .filter((l) => l && l.scope?.model?.display_name && typeof l.percent === "number")
+    .map((l) => ({ name: l.scope.model.display_name, family: familyOf(l.scope.model.display_name), pct: l.percent, resetsAt: l.resets_at || null, capped: l.percent >= 99 }));
+}
+// The word model ids and aliases share: "Fable" -> fable, "Opus 5" -> opus.
+function familyOf(name) {
+  return String(name || "").toLowerCase().split(/[^a-z]+/).find((w) => w && w !== "claude") || "";
+}
+function cappedLimit(quota, model) {
+  const m = String(model || "").toLowerCase();
+  return (m && modelLimits(quota).find((l) => l.capped && l.family && m.includes(l.family))) || null;
+}
+
+// Claude Code's default model, as /model last saved it.
+function defaultModel() {
+  try { return JSON.parse(fs.readFileSync(path.join(os.homedir(), ".claude", "settings.json"), "utf8")).model || null; } catch { return null; }
+}
+
+// The model a run asks for. Nothing (the CLI's own choice, as always) while no
+// model is capped. With one capped, name one explicitly so neither the default nor
+// a resumed conversation's own model can put the run on it: the default if it has
+// room, else the conversation's, else Opus, else Sonnet. A long conversation
+// (bigContext) or a 1M default keeps a 1M window on the fallbacks, since the plain
+// aliases resolve to 200k. A default naming no model family (an alias such as
+// "best") is skipped: it could resolve to the capped one. undefined: all capped.
+const BIG_CONTEXT = 180000;
+function runModel(quota, convModel = null, bigContext = false) {
+  if (!modelLimits(quota).some((l) => l.capped)) return null;
+  const def = defaultModel();
+  const oneM = bigContext || /\[1m\]$/i.test(def || "");
+  const wide = (m) => (m && oneM && !/\[1m\]$/i.test(m) ? m + "[1m]" : m);
+  return [/fable|mythos|opus|sonnet|haiku/i.test(def || "") ? def : null, wide(convModel), wide("opus"), wide("sonnet")]
+    .filter(Boolean).find((m) => !cappedLimit(quota, m));
+}
+
 // ── Calibration + warning state (~/.trac) ──────────────────────────────────
 const SPARE_DIR = path.join(os.homedir(), ".trac");
 
@@ -149,19 +190,22 @@ function updateCalibration(quota, events, active) {
   }
 }
 
+// A reset time as a key, to the minute: the endpoint returns the same reset with
+// different fractional seconds from one reading to the next.
+function resetKey(iso) {
+  const t = Date.parse(iso || "");
+  return Number.isNaN(t) ? "" : new Date(Math.round(t / 60000) * 60000).toISOString();
+}
+
 // Limit warnings — fired from the json path (sparebar polls it every 60s).
 // Each threshold fires once per reset period.
 function maybeNotify(quota, active) {
   if (process.platform !== "darwin" || !quota) return;
   const st = loadState("notify.json", {});
-  const fire = (msg) => {
-    try {
-      execSync(`osascript -e 'display notification ${JSON.stringify(msg)} with title "Trac"'`, { stdio: "ignore" });
-    } catch {}
-  };
+  const fire = notify;
 
   const s = quota.five_hour;
-  const sKey = s.resets_at || "session";
+  const sKey = resetKey(s.resets_at) || "session";
   if (st.sessionKey !== sKey) { st.sessionKey = sKey; st.sessionFired = []; }
   st.sessionFired ||= [];
   const resetStr = s.resets_at ? fmtTime(Date.parse(s.resets_at)) : "";
@@ -180,12 +224,36 @@ function maybeNotify(quota, active) {
   }
 
   const w = quota.seven_day;
-  const wKey = w.resets_at || "week";
+  const wKey = resetKey(w.resets_at) || "week";
   if (st.weekKey !== wKey) { st.weekKey = wKey; st.weekFired = []; }
   st.weekFired ||= [];
   if (w.utilization >= 90 && !st.weekFired.includes(90)) {
     st.weekFired.push(90);
     fire(`Weekly quota at ${Math.round(w.utilization)}% — resets ${w.resets_at ? fmtDay(Date.parse(w.resets_at)) : "soon"}`);
+  }
+
+  // A model's own limit (Fable, say): at 90% and when it caps, once each per reset,
+  // only the higher one when a reading crosses both.
+  st.modelFired ||= {};
+  const limits = modelLimits(quota);
+  const keyOf = (l) => `${l.name}@${resetKey(l.resetsAt)}`;
+  for (const l of limits) {
+    const fired = st.modelFired[keyOf(l)] ||= [];
+    const reached = [90, 100].filter((t) => l.pct >= (t === 100 ? 99 : t));
+    if (!reached.length || reached.every((t) => fired.includes(t))) continue;
+    const top = reached.at(-1);
+    fired.push(...reached.filter((t) => !fired.includes(t)));
+    const when = l.resetsAt ? `${fmtDay(Date.parse(l.resetsAt))} ${fmtTime(Date.parse(l.resetsAt))}` : "soon";
+    const then = top === 100 && watchedRepos().length ? whenModelCapped(quota, null) : null;
+    fire(top === 100
+      ? `${l.name} limit reached, resets ${when}.${then ? ` Sessions Trac picks up there continue ${then}.` : ""}`
+      : `${l.name} limit at ${Math.round(l.pct)}%, resets ${when}`);
+  }
+  // Forget a limit only once its reset has passed: a reading that briefly lacks it
+  // must not make it announce itself again.
+  for (const k of Object.keys(st.modelFired)) {
+    const at = Date.parse(k.slice(k.indexOf("@") + 1));
+    if (!limits.some((l) => keyOf(l) === k) && !(at > Date.now() - 3600000)) delete st.modelFired[k];
   }
   saveState("notify.json", st);
 }
@@ -291,11 +359,12 @@ async function cmdStatus(events) {
       const color = frac > 0.8 ? C.red : frac > 0.5 ? C.orange : C.green;
       const reset = new Date(resetsAt);
       const sameDay = reset.toDateString() === new Date(now).toDateString();
-      const when = (sameDay ? "" : fmtDay(reset) + " ") + fmtTime(reset);
-      console.log(`  ${label.padEnd(16)} ${color(bar(frac))}  ${C.bold(Math.round(pct) + "%")} ${C.dim("· resets " + when)}`);
+      const when = resetsAt ? (sameDay ? "" : fmtDay(reset) + " ") + fmtTime(reset) : null;
+      console.log(`  ${label.padEnd(16)} ${color(bar(frac))}  ${C.bold(Math.round(pct) + "%")}${when ? " " + C.dim("· resets " + when) : ""}`);
     };
     gauge("Session (5h)", quota.five_hour.utilization, quota.five_hour.resets_at);
     gauge("Week", quota.seven_day.utilization, quota.seven_day.resets_at);
+    for (const l of modelLimits(quota)) gauge(`${l.name} limit`, l.pct, l.resetsAt);
     if (active && quota.five_hour.utilization > 0) {
       const burnPerHr = active.cost / ((now - active.start) / 3600000);
       const impliedCap = (active.cost / quota.five_hour.utilization) * 100;
@@ -430,6 +499,7 @@ async function cmdJson(events) {
   const burnPerHr = active ? active.cost / ((now - active.start) / 3600000) : 0;
   console.log(JSON.stringify({
     ok: true, source, plan: readPlan(), session, week,
+    models: modelLimits(quota).map((l) => ({ name: l.name, pct: Math.round(l.pct), resetsAt: l.resetsAt })),
     extra: extraFrom(quota),
     burnPerHr: +burnPerHr.toFixed(2),
     windowCost: active ? +active.cost.toFixed(2) : 0,
@@ -488,8 +558,10 @@ const WEEK_MAX_PCT = 90;     // stop background work near the weekly cap
 const IDLE_MIN = 15;         // human must be idle this long before dispatch
 const TASK_TIMEOUT_MIN = 30; // hard wall-clock cap per task
 const RESUME_MAX = 3;        // a task paused by quota is resumed at most this many times
-// What a `claude -p` run says when the subscription window is exhausted.
-const QUOTA_RE = /hit your limit|usage limit|limit reached|rate.?limit|out of (?:extra )?usage|resets (?:at|in) /i;
+// What a `claude -p` run says when a limit stops it: "You've hit your session
+// limit", "...your weekly limit", "...your Fable limit", "You're out of usage
+// credits", and older wordings.
+const QUOTA_RE = /hit your (?:[\w’']+ ){0,3}(?:limit|budget)|usage limit|limit reached|rate.?limit|out of (?:extra )?usage|resets (?:at|in) /i;
 
 function loadTasks() { return loadState("tasks.json", { nextId: 1, tasks: [] }); }
 function saveTasks(db) { saveState("tasks.json", db); }
@@ -576,7 +648,8 @@ async function prepTask(task) {
 
   process.stdout.write(`  prepping ${task.id}… `);
   // manual: user is present, so don't yield to human activity. Budget: 10 min, 25 turns.
-  const res = await runClaude(prompt, task.repo, tools, "build", { manual: true, timeoutMin: 10, maxTurns: 25 });
+  const model = runModel(await fetchQuota()) || null;
+  const res = await runClaude(prompt, task.repo, tools, "build", { manual: true, timeoutMin: 10, maxTurns: 25, model });
   const ok = res.ok && fs.existsSync(path.join(specDir, "SPEC.md"));
   if (ok) {
     mutateTasks((db) => { const t = db.tasks.find((x) => x.id === task.id); if (t) t.specDir = specDir; });
@@ -666,13 +739,36 @@ function sessionFiles({ cwd = null } = {}) {
   return files.sort((a, b) => b.mtime - a.mtime);
 }
 
+// `lastActiveAt` is the conversation's last message of any kind, including a
+// limit error; `lastAnsweredAt` its last real answer; `model` the model it is on (a
+// /model switch or the last answer, whichever came later); `ctx` the context size
+// at that answer; `stoppedByLimit` whether it ends on a limit error. None of them
+// counts bookkeeping lines, which an open window keeps appending to a transcript.
 function readSessionMeta(file) {
-  const m = { id: path.basename(file, ".jsonl"), file, cwd: null, title: null, firstPrompt: null, turns: 0, lastTurnAt: 0, mtime: 0 };
+  const m = { id: path.basename(file, ".jsonl"), file, cwd: null, title: null, firstPrompt: null, turns: 0, lastTurnAt: 0,
+    lastActiveAt: 0, lastAnsweredAt: 0, model: null, ctx: 0, stoppedByLimit: false, mtime: 0 };
   let text;
   try { m.mtime = fs.statSync(file).mtimeMs; text = fs.readFileSync(file, "utf8"); } catch { return null; }
   for (const line of text.split("\n")) {
     if (!line) continue;
     let d; try { d = JSON.parse(line); } catch { continue; }
+    if (d.type === "user" || d.type === "assistant") {
+      m.lastActiveAt = Math.max(m.lastActiveAt, Date.parse(d.timestamp) || 0);
+      if (!d.isSidechain) m.stoppedByLimit = false;
+    }
+    if (d.type === "attachment" && !d.isSidechain && d.attachment?.type === "model" && d.attachment.identity?.modelId) m.model = d.attachment.identity.modelId;
+    if (d.type === "assistant" && !d.isSidechain) {
+      const model = d.message?.model || "";
+      if (model && !model.startsWith("<")) {
+        m.model = model;
+        m.lastAnsweredAt = Date.parse(d.timestamp) || m.lastAnsweredAt;
+        const u = d.message.usage;
+        if (u) m.ctx = (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0);
+      } else if (d.isApiErrorMessage) {
+        const c = d.message?.content;
+        m.stoppedByLimit = QUOTA_RE.test(Array.isArray(c) ? c.map((x) => x?.text || "").join(" ") : String(c || ""));
+      }
+    }
     if (d.type === "ai-title" && d.aiTitle) m.title = d.aiTitle;
     else if (d.type === "user" && !d.isSidechain) {
       const c = d.message?.content;
@@ -816,8 +912,9 @@ async function cmdAdopt(rest) {
 
 // ── Auto-adopt: a session that hits the limit in a watched repo ─────────────
 // The daemon never needs the limit message. When the live gauge reads capped,
-// whichever sessions started in a watched directory were active in the last
-// AUTO_ADOPT_LOOKBACK_MIN minutes are the ones that ran into the wall.
+// whichever sessions started in a watched directory had a message in the last
+// AUTO_ADOPT_LOOKBACK_MIN minutes are the ones that ran into the wall; at a
+// model's own limit, those of them last answered by that model.
 const AUTO_ADOPT_LOOKBACK_MIN = 30;
 
 function watchedRepos() {
@@ -877,7 +974,11 @@ function notify(msg) {
 function inRepo(cwd, repo) { return !!cwd && (cwd === repo || cwd.startsWith(repo + "/")); }
 
 function autoAdoptCapped(quota) {
-  if (!quota || quota.five_hour.utilization < 99) return [];
+  if (!quota) return [];
+  // The session window caps everything; a model's own limit (Fable, say) caps only
+  // the sessions running on that model, which trac continues on one with room.
+  const sessionCapped = quota.five_hour.utilization >= 99;
+  if (!sessionCapped && !modelLimits(quota).some((l) => l.capped)) return [];
   const watched = watchedRepos();
   if (!watched.length) return [];
   const tasks = loadTasks().tasks, retired = retiredSessions();
@@ -889,15 +990,30 @@ function autoAdoptCapped(quota) {
     const id = path.basename(file, ".jsonl");
     if (owned.has(id)) continue;
     const m = readSessionMeta(file);
-    if (!m || !m.turns || !watched.some((r) => inRepo(m.cwd, r))) continue;
+    if (!m || !m.turns || m.lastActiveAt < cutoff || !watched.some((r) => inRepo(m.cwd, r))) continue;
+    // At a model cap only a conversation that ended on the limit error ran into the
+    // wall; one still being answered (a limit at 99%, usage credits) is left alone.
+    const hit = sessionCapped ? null : cappedLimit(quota, m.model);
+    if (!sessionCapped && (!hit || !m.stoppedByLimit)) continue;
     if (tracHolds(tasks, retired, id, m.lastTurnAt)) continue;
-    const { task: t, created } = adoptSession(m, { repo: m.cwd, auto: true, resetsAt: quota.five_hour.resets_at });
+    const { task: t, created } = adoptSession(m, { repo: m.cwd, auto: true, resetsAt: sessionCapped ? quota.five_hour.resets_at : null });
     owned.add(id);
     if (!created) continue;
     adopted.push(t);
-    notify(`Picked up "${titleOf(t).slice(0, 48)}" at the limit; it continues after the reset. Stop: trac release ${t.id}`);
+    notify(hit
+      ? `Picked up "${titleOf(t).slice(0, 40)}" at the ${hit.name} limit; it continues ${whenModelCapped(quota, m)}. Stop: trac release ${t.id}`
+      : `Picked up "${titleOf(t).slice(0, 48)}" at the limit; it continues after the reset. Stop: trac release ${t.id}`);
   }
   return adopted;
+}
+
+// When a session picked up at a model's limit will run, in words: the daemon's
+// week gate or a cap on every model can hold it back.
+function whenModelCapped(quota, m) {
+  if (quota.seven_day.utilization >= WEEK_MAX_PCT)
+    return `after the weekly reset (${quota.seven_day.resets_at ? fmtDay(Date.parse(quota.seven_day.resets_at)) : "soon"})`;
+  const on = runModel(quota, m?.model || null, (m?.ctx || 0) > BIG_CONTEXT);
+  return on ? `on ${on} once you are away` : "once a model has room";
 }
 
 function cmdWatch(rest, on) {
@@ -932,7 +1048,10 @@ function transcriptMeta(sessionId) {
 function sessionMovedOn(t) {
   const src = transcriptMeta(t.sourceSession);
   const freeAt = Date.parse(t.freeAt || t.createdAt) || 0;
-  if (src && t.sourceTurns != null && src.turns > t.sourceTurns && src.mtime > freeAt)
+  // A new prompt counts only once it got a real answer after that: at a model's
+  // limit the session is free at once, but a prompt the capped model refused is not
+  // someone carrying on.
+  if (src && t.sourceTurns != null && src.turns > t.sourceTurns && src.lastAnsweredAt > freeAt)
     return "the original session was continued after the handoff, so trac let go";
   if (t.sessionId && t.forkTurns != null) {
     const f = transcriptMeta(t.sessionId);
@@ -1075,6 +1194,11 @@ async function dispatch(task, { dry = false, manual = false, fresh = false } = {
   if (specDir) t.specDir = specDir;
 
   const quotaBefore = await fetchQuota();
+  // At a model's own limit the run names a model with room (runModel). A session's
+  // own model is the one that last answered in the conversation it continues.
+  const conv = isSession && !dry ? transcriptMeta(resuming ? t.sessionId : t.sourceSession) : null;
+  const model = dry ? null : runModel(quotaBefore, conv?.model || null, (conv?.ctx || 0) > BIG_CONTEXT) || null;
+  if (model) t.model = model; else delete t.model;
   const specNote = specDir
     ? `A prepared spec folder exists at ${specDir}. Read SPEC.md there FIRST and treat it ` +
       `as authoritative; asset files referenced by it are in that folder.\n\n`
@@ -1121,10 +1245,10 @@ async function dispatch(task, { dry = false, manual = false, fresh = false } = {
     result = { ok: true, summary: "(dry run — no Claude invocation)", turns: 0 };
   } else if (isSession) {
     result = await runClaude(sessionWrapper, t.repo, tools, "build", {
-      manual, sessionId: t.sessionId, resume: resuming, forkFrom: resuming ? null : t.sourceSession, onSpawn,
+      manual, sessionId: t.sessionId, resume: resuming, forkFrom: resuming ? null : t.sourceSession, onSpawn, model,
     });
   } else {
-    result = await runClaude(wrapper, worktree, tools, t.mode, { manual, sessionId: t.sessionId, resume: resuming, onSpawn });
+    result = await runClaude(wrapper, worktree, tools, t.mode, { manual, sessionId: t.sessionId, resume: resuming, onSpawn, model });
   }
 
   let commits = 0;
@@ -1149,12 +1273,14 @@ async function dispatch(task, { dry = false, manual = false, fresh = false } = {
   }
 
   // Did the run stop because the window ran out? Either claude said so, or the
-  // live gauge reads capped right after a failure. Then the task is paused, not
-  // failed: the daemon resumes it once the window resets and the reserve fits.
+  // live gauge reads capped right after a failure: the session window, or the
+  // model the run used (any model, when it named none). Then the task is paused,
+  // not failed: the daemon resumes it once there is room, on a model with room.
   const finished = result.ok && (isSession || commits > 0 || t.mode === "analyze");
+  const modelHit = !!quotaAfter && (model ? !!cappedLimit(quotaAfter, model) : modelLimits(quotaAfter).some((l) => l.capped));
   const quotaHit = !dry && !result.interrupted && !finished &&
-    (QUOTA_RE.test(`${result.error || ""} ${result.summary || ""}`) ||
-     (quotaAfter && quotaAfter.five_hour.utilization >= 99));
+    (QUOTA_RE.test(`${result.error || ""} ${result.ok ? "" : result.summary || ""}`) ||
+     (quotaAfter && (quotaAfter.five_hour.utilization >= 99 || modelHit)));
   // An adopted session has no spec to fail against: when its time slice or turn
   // budget runs out it simply pauses and continues in the next slice.
   const sliceEnded = isSession && !finished && !result.interrupted && (result.timedOut || result.subtype === "error_max_turns");
@@ -1211,6 +1337,7 @@ async function dispatch(task, { dry = false, manual = false, fresh = false } = {
     if (t.pushed) ft.pushed = t.pushed;
     if (t.prUrl) ft.prUrl = t.prUrl;
     if (t.pushError) ft.pushError = t.pushError;
+    if (t.model) ft.model = t.model; else delete ft.model;
     Object.assign(t, ft); // return value reflects the persisted record
   });
   return t;
@@ -1235,10 +1362,11 @@ function claudeBin() {
 }
 
 // Headless Claude with wall-clock timeout and stop-on-human-activity
-function runClaude(prompt, cwd, tools, mode, { manual = false, timeoutMin = TASK_TIMEOUT_MIN, maxTurns = 60, sessionId = null, resume = false, forkFrom = null, onSpawn = null } = {}) {
+function runClaude(prompt, cwd, tools, mode, { manual = false, timeoutMin = TASK_TIMEOUT_MIN, maxTurns = 60, sessionId = null, resume = false, forkFrom = null, onSpawn = null, model = null } = {}) {
   return new Promise((resolve) => {
     const args = ["-p", prompt, "--output-format", "json", "--max-turns", String(maxTurns), "--allowedTools", tools];
     if (mode === "build") args.push("--permission-mode", "acceptEdits");
+    if (model) args.push("--model", model);
     // First attempt names the session; later attempts continue it with full context.
     // An adopted session is forked on its first attempt, so the user's own copy of
     // the conversation is never written to.
@@ -1299,6 +1427,8 @@ async function cmdRun(rest) {
     if (!task) { console.error(`no runnable task ${id}`); process.exit(1); }
     if (!dry && sessionPct + task.budget > RESERVE_PCT)
       console.log(C.orange(`  warning: session at ${Math.round(sessionPct)}%, task budget ${task.budget}% breaches the ${RESERVE_PCT}% reserve — running anyway (manual)`));
+    if (!dry && runModel(quota) === undefined)
+      console.log(C.orange(`  warning: every model trac could run on is at its limit — running anyway on Claude Code's default (manual)`));
   } else {
     task = pickTask(dry ? 0 : sessionPct);
     if (!task) { console.log("  nothing runnable (queue empty, or no task fits current headroom)"); return; }
@@ -1343,8 +1473,10 @@ async function cmdDaemonTick(events) {
     // dispatch gates — every one must pass
     const quota = await fetchQuota();
     if (!quota) return;                                       // no ground truth → don't spend
+    maybeNotify(quota, null);                                 // limit warnings, also without the gauge
     autoAdoptCapped(quota);                                   // capped: pick up what hit the wall in watched repos
     if (quota.seven_day.utilization >= WEEK_MAX_PCT) return;  // save the week
+    if (runModel(quota) === undefined) return;                // every model trac could run on is capped
     if (humanActive()) return;                                // never compete with the human
     const task = pickTask(quota.five_hour.utilization);       // fits under reserve?
     if (!task) return;
@@ -1454,7 +1586,7 @@ function cmdMorning() {
       console.log(`  ${C.green("●")} ${C.bold(t.id)} ${titleOf(t).slice(0, 60)}`);
       if (t.kind === "session") {
         if (t.summary) console.log(C.dim(`     ${t.summary.replace(/\s+/g, " ").slice(0, 200)}`));
-        console.log(C.dim(`     continue it: claude --resume ${t.sessionId}${t.windowPctUsed != null ? ` · ${t.windowPctUsed}% window` : ""}`));
+        console.log(C.dim(`     continue it: claude --resume ${t.sessionId}${t.windowPctUsed != null ? ` · ${t.windowPctUsed}% window` : ""}${t.model ? ` · ran on ${t.model}` : ""}`));
         continue;
       }
       console.log(`     ${t.commits} commit(s) on ${C.bold(t.branch)}${t.windowPctUsed != null ? C.dim(` · ${t.windowPctUsed}% window`) : ""}${t.prUrl ? `\n     PR: ${t.prUrl}` : ""}`);
@@ -1596,6 +1728,7 @@ async function cmdUi(rest) {
         source: "live",
         session: { pct: Math.round(quota.five_hour.utilization), resetsAt: quota.five_hour.resets_at },
         week: { pct: Math.round(quota.seven_day.utilization), resetsAt: quota.seven_day.resets_at },
+        models: modelLimits(quota).map((l) => ({ name: l.name, pct: Math.round(l.pct), resetsAt: l.resetsAt })),
         extra: extraFrom(quota),
       };
     }
@@ -1684,7 +1817,8 @@ const UI_HTML = `<!DOCTYPE html>
   header { display: flex; align-items: baseline; gap: 14px; padding: 60px 0 6px; }
   h1 { font-size: 28px; font-weight: 400; font-family: 'EB Garamond', Georgia, serif; }
   .plan { color: var(--sub); font-size: 12px; }
-  .gauges { display: flex; gap: 20px; margin: 12px 0 28px; font-size: 12px; color: var(--sub); }
+  .gauges { display: flex; flex-wrap: wrap; gap: 6px 20px; margin: 12px 0 28px; font-size: 12px; color: var(--sub); }
+  .gauge { white-space: nowrap; }
   .gauge b { font-size: 12px; color: var(--text); font-weight: 400; }
   .gbar { display: inline-block; width: 96px; height: 4px; border-radius: 2px; background: #EEEEEE; vertical-align: middle; margin: 0 8px 2px; overflow: hidden; }
   .gbar i { display: block; height: 100%; border-radius: 2px; background: var(--green); }
@@ -1769,6 +1903,7 @@ function render() {
   g.innerHTML = state.session
     ? '<span class="gauge">Session' + gbar(state.session.pct) + '<b>' + state.session.pct + '%</b></span>' +
       (state.week ? '<span class="gauge">Week' + gbar(state.week.pct) + '<b>' + state.week.pct + '%</b></span>' : '') +
+      (state.models || []).map(m => '<span class="gauge">' + esc(m.name) + gbar(m.pct) + '<b>' + m.pct + '%</b></span>').join('') +
       (state.source === "estimate" ? '<span class="gauge" style="color:var(--faint)">estimated</span>' : '')
     : '<span class="gauge">quota unavailable</span>';
   document.getElementById("tabs").innerHTML = TABS.map(([id, label, f]) =>
@@ -1805,6 +1940,7 @@ function card(t) {
     t.mergeCommit ? "merged " + t.mergeCommit.slice(0, 7) : null,
     t.revertCommit ? "reverted " + t.revertCommit.slice(0, 7) : null,
     t.windowPctUsed != null ? t.windowPctUsed + "% window" : null,
+    t.model ? "ran on " + esc(t.model) : null,
     t.branch ? "<code>" + esc(t.branch) + "</code>" : null,
     t.prUrl ? '<a href="' + t.prUrl + '" target="_blank">PR</a>' : null,
   ].filter(Boolean).join(" \\u00b7 ");

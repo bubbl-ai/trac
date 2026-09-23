@@ -73,7 +73,7 @@ reference for every flag.
 
    From now on, every 15 minutes, Trac runs the next queued task if the live gauge is
    readable, the session window plus the task's budget is under 75%, the week is under
-   90%, and you have been idle 15 minutes. Queue tasks with `trac add` in the evening and
+   90%, a model it can run on has room, and you have been idle 15 minutes. Queue tasks with `trac add` in the evening and
    read `trac morning` the next day. `trac daemon uninstall` turns it off.
 
 8. **Hand a session over when you hit the wall.** Inside a Claude Code session that just
@@ -101,8 +101,10 @@ reference for every flag.
    ```
 
    Any session started there that is active when the window caps is adopted
-   automatically and continued after the reset. If you carry on in the original session
-   yourself, Trac notices and lets go. `trac unwatch ~/proj` stops it.
+   automatically and continued after the reset. One that stops on a single model's own
+   limit, such as a weekly Fable limit, is picked up too and continued on a model with
+   room once you are away, without waiting for that limit's reset. If you carry on in the original session yourself, Trac notices and
+   lets go. `trac unwatch ~/proj` stops it.
 
 10. **Undo anything.** `trac rm t3` deletes a task and its worktree, `trac release t3`
     hands a session back, `trac unwatch` stops automatic pickup, `trac daemon uninstall`
@@ -210,11 +212,12 @@ The daemon dispatches one task only when every gate passes:
 - the live quota is readable
 - the session window plus the task's budget stays under a 75% reserve
 - the week is under 90%
+- some model it can run on has room (see model limits under "Picking sessions up automatically")
 - you have been idle for 15 minutes or more
 
 A running task is killed the moment you become active and is hard-capped at 30 minutes.
 `trac run` bypasses the idle gate and warns instead of refusing when a task would breach
-the reserve, because you are at the keyboard to decide.
+the reserve or every model is at its limit, because you are at the keyboard to decide.
 
 ### Running out of quota mid-task
 
@@ -281,10 +284,25 @@ stopped first. The dashboard's Release button does the same.
 `trac watch` marks the current directory, or a path, as one where a session that runs
 into the window limit should be picked up without a handoff. The daemon does not need
 the limit message for this: on any tick where the live gauge reads capped, every
-session started in a watched directory that was active in the last 30 minutes is
+session started in a watched directory that had a message in the last 30 minutes is
 adopted, with a notification naming the task, and continued after the reset exactly
 as a handed-off session would be. `trac unwatch` stops it and `trac watch --list`
 shows what is watched. Nothing watches until the daemon is installed.
+
+A plan can also cap one model on its own, such as a weekly Fable limit, while the
+others still have room. Then the sessions in watched directories that were on that
+model and ended on its limit error in the last 30 minutes are picked up the same way.
+A session still being answered (the limit at 99%, or usage credits paying for it) is
+left alone. They are continued once you have been idle 15 minutes, without waiting
+for that limit to reset: on your default model (the one `/model` last saved) if it is
+not the capped one, otherwise the conversation's own model, then Opus, then Sonnet. A
+long conversation keeps a 1M context window on these, as does a 1M default. While any
+model is capped, every run Trac starts names its model this way, and the scheduler
+waits if all of them are capped; the task records which model it ran on. The week gate
+still applies, so above 90% of the week a picked-up session waits for the weekly reset.
+At a model's limit a prompt the capped model refused does not count as you carrying
+on. `trac status`, the gauge's menu and the dashboard show each model's limit, and a
+notification says when one passes 90% and when it caps.
 
 Because nobody said "take this", Trac is careful about one thing: if you carry on in
 the original session yourself, Trac lets go. Before every run it counts your prompts
@@ -316,8 +334,9 @@ trac menubar               # compile if needed, start now, and start at every lo
 trac menubar uninstall
 ```
 
-🟢 under 50% · 🟠 50 to 80% · 🔴 80% and up. Click it for the week, reset times, burn rate
-and task counts. At the limit it reads just 🔴 100% and stops polling until the first poll
+🟢 under 50% · 🟠 50 to 80% · 🔴 80% and up. Click it for the week, any model's own limit
+(Fable, say), reset times, burn rate and task counts. A model's limit is shown only in the
+menu, never the title. At the session limit it reads just 🔴 100% and stops polling until the first poll
 after the reset; the reset time and the task counts are in its menu, not the title, so
 hitting the limit does not widen the item and push other menu bar icons out of sight (on a
 notched Mac there is little room).

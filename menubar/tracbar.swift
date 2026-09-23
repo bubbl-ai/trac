@@ -68,6 +68,9 @@ final class TracBar: NSObject, NSApplicationDelegate {
       let tasks = j["tasks"] as? [String: Int] ?? [:]
       let sReset = Self.fmtReset(session["resetsAt"] as? String)
       let wReset = Self.fmtReset(week["resetsAt"] as? String)
+      // A model's own limit (Fable, say). Menu rows only: it can last days, and the
+      // title must not widen (see the capped branch below).
+      let models = j["models"] as? [[String: Any]] ?? []
       // Paid extra-usage credits — null/absent when not enabled on this account.
       let extra = j["extra"] as? [String: Any]
       let extraEnabled = (extra?["enabled"] as? Bool) ?? false
@@ -105,6 +108,12 @@ final class TracBar: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem.separator())
         menu.addItem(Self.label("Session  \(Self.dot(sPct)) \(sPct)%\(sReset.map { " · resets \($0)" } ?? "")"))
         menu.addItem(Self.label("Week     \(Self.dot(wPct)) \(wPct)%\(wReset.map { " · resets \($0)" } ?? "")"))
+        for m in models {
+          guard let name = m["name"] as? String, let pct = m["pct"] as? Int else { continue }
+          let col = name.count < 9 ? name.padding(toLength: 9, withPad: " ", startingAt: 0) : name + " "
+          let reset = Self.fmtReset(m["resetsAt"] as? String)
+          menu.addItem(Self.label("\(col)\(Self.dot(pct)) \(pct)%\(reset.map { " · resets \($0)" } ?? "")"))
+        }
         if extraEnabled {
           menu.addItem(Self.label(String(format: "Extra    $%.2f of $%.2f used", extraUsed, extraLimit)))
         }
